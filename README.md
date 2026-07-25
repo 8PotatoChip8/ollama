@@ -36,11 +36,22 @@ This fork fixes that in two ways:
    is re-sent to your **primary** model as text. Your primary model stays the
    brain for the whole task; the fallback is just the "eyes."
 
+   The caption is **context-aware**: the fallback is given the user's text that
+   accompanied the image (e.g. "what's causing this error in the screenshot?"),
+   so it describes the image with the user's intent in mind — focusing on what
+   is relevant to the request and transcribing the relevant text/code/labels —
+   rather than narrating the whole frame generically. (When an image arrives
+   with no accompanying text, e.g. from a tool, a generic describe-everything
+   prompt is used.)
+
 Because the Anthropic Messages API is stateless, the client re-sends the full
 history (including the image) on every turn. To keep this efficient, captions
-are cached by image hash and a model that rejects images is remembered as
-non-vision — so after the first image turn, each subsequent turn is a single
-call to your primary model.
+are cached by image hash **plus the accompanying text**, and a model that
+rejects images is remembered as non-vision — so after the first image turn,
+each subsequent turn is a single call to your primary model. Keying the cache
+on the accompanying text means the same screenshot asked about under a
+different intent is re-captioned, while the same image re-sent under the same
+intent across turns hits the cache.
 
 ### Configuration
 
@@ -71,8 +82,10 @@ the conversion path, and non-vision models surface the original error as before.
 - Captioning is **lossy**: the primary model sees the fallback's text
   description of the image, not the pixels. For screenshots of text/code/logs
   the caption transcribes them verbatim, so little is lost; for fine visual or
-  pixel-precise reasoning, some detail may be lost. (Image-capable primaries
-  are never captioned — they get the real pixels.)
+  pixel-precise reasoning, some detail may be lost. Context-aware captioning
+  (above) reduces this lossiness in practice by focusing the description on
+  what the user actually asked about. (Image-capable primaries are never
+  captioned — they get the real pixels.)
 - If captioning fails, the turn degrades gracefully: the fallback model answers
   the image turn directly.
 - Requests that combine `web_search` tools with images take the existing

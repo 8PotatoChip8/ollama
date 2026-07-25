@@ -64,7 +64,14 @@ func TestIsImageNotSupportedError(t *testing.T) {
 // imageRequestBody is a minimal Anthropic /v1/messages request carrying an
 // image content block, addressed to the given cloud model.
 func imageRequestBody(model string) string {
-	return `{"model":"` + model + `","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
+	return imageRequestBodyWithText(model, "what is this?")
+}
+
+// imageRequestBodyWithText is a minimal Anthropic /v1/messages request carrying
+// an image content block alongside the given user text, addressed to the given
+// cloud model. The text is what the captioner should receive as context.
+func imageRequestBodyWithText(model, text string) string {
+	return `{"model":"` + model + `","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":[{"type":"text","text":"` + text + `"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
 }
 
 // resetVisionCaches clears the package-level caption and non-vision caches so
@@ -89,6 +96,46 @@ func newImageFallbackUpstream(t *testing.T, respond func(model string, call int)
 		}
 		_ = json.Unmarshal(payload, &req)
 		captured = append(captured, req.Model)
+		n := counts[req.Model]
+		counts[req.Model] = n + 1
+		status, body := respond(req.Model, n)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &captured
+}
+
+// capturedReq records a single upstream request's model and first message
+// content, so tests can assert what the captioner was asked.
+type capturedReq struct {
+	Model   string
+	Content string
+}
+
+// newImageFallbackUpstreamCapturing is like newImageFallbackUpstream but also
+// records the first message content of each request, so tests can verify the
+// caption request carries the user's accompanying text.
+func newImageFallbackUpstreamCapturing(t *testing.T, respond func(model string, call int) (int, string)) (*httptest.Server, *[]capturedReq) {
+	t.Helper()
+	var captured []capturedReq
+	counts := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := io.ReadAll(r.Body)
+		var req struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(payload, &req)
+		content := ""
+		if len(req.Messages) > 0 {
+			content = req.Messages[0].Content
+		}
+		captured = append(captured, capturedReq{Model: req.Model, Content: content})
 		n := counts[req.Model]
 		counts[req.Model] = n + 1
 		status, body := respond(req.Model, n)
@@ -357,4 +404,137 @@ func TestCloudPassthroughMiddleware_DivertsImageRequests(t *testing.T) {
 			t.Fatal("expected text-only request to be raw-proxied, not diverted")
 		}
 	})
+}
+
+// TestCloudVisionFallback_CaptionUsesRequestContext verifies that the caption
+// request sent to the fallback vision model includes the user's accompanying
+// text, so the captioner describes the image with the user's intent in mind
+// rather than as a context-free "describe everything" prompt.
+func TestCloudVisionFallback_CaptionUsesRequestContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+	resetVisionCaches()
+
+	t.Setenv("OLLAMA_CLOUD_VISION_FALLBACK", "minimax-m3:cloud")
+
+	upstream, captured := newImageFallbackUpstreamCapturing(t, func(model string, call int) (int, string) {
+		switch model {
+		case "glm-5.2":
+			if call == 0 {
+				return http.StatusBadRequest, `{"error":"this model does not support image input"}`
+			}
+			return http.StatusOK, `{"message":{"role":"assistant","content":"answered"},"done":true}`
+		case "minimax-m3":
+			return http.StatusOK, `{"message":{"role":"assistant","content":"a red square"},"done":true}`
+		default:
+			return http.StatusBadRequest, `{"error":"unexpected model ` + model + `"}`
+		}
+	})
+
+	original := cloudProxyBaseURL
+	cloudProxyBaseURL = upstream.URL
+	t.Cleanup(func() { cloudProxyBaseURL = original })
+
+	s := &Server{}
+	router, err := s.GenerateRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := httptest.NewServer(router)
+	defer local.Close()
+
+	resp, err := http.Post(local.URL+"/v1/messages", "application/json",
+		bytes.NewBufferString(imageRequestBodyWithText("glm-5.2:cloud", "what error is shown in this screenshot?")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d (%s)", resp.StatusCode, string(body))
+	}
+
+	// Find the caption request (the one sent to the fallback model) and assert
+	// it carries the user's accompanying text.
+	var captionReq *capturedReq
+	for i := range *captured {
+		if (*captured)[i].Model == "minimax-m3" {
+			captionReq = &(*captured)[i]
+			break
+		}
+	}
+	if captionReq == nil {
+		t.Fatalf("expected a caption request to minimax-m3, got %v", *captured)
+	}
+	if !strings.Contains(captionReq.Content, "what error is shown in this screenshot?") {
+		t.Fatalf("caption request should include the user's accompanying text, got %q", captionReq.Content)
+	}
+}
+
+// TestCloudVisionFallback_CacheKeysOnAccompanyingText verifies that the caption
+// cache is keyed on (image, accompanying text): the same image sent under a
+// different user intent is re-captioned, while the same image+intent repeated
+// hits the cache. With the same image throughout, two distinct intents should
+// produce exactly two caption calls; repeating the first intent adds none.
+func TestCloudVisionFallback_CacheKeysOnAccompanyingText(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+	resetVisionCaches()
+
+	t.Setenv("OLLAMA_CLOUD_VISION_FALLBACK", "minimax-m3:cloud")
+
+	upstream, captured := newImageFallbackUpstream(t, func(model string, call int) (int, string) {
+		switch model {
+		case "glm-5.2":
+			if call == 0 {
+				return http.StatusBadRequest, `{"error":"this model does not support image input"}`
+			}
+			return http.StatusOK, `{"message":{"role":"assistant","content":"answered"},"done":true}`
+		case "minimax-m3":
+			return http.StatusOK, `{"message":{"role":"assistant","content":"caption"},"done":true}`
+		default:
+			return http.StatusBadRequest, `{"error":"unexpected model ` + model + `"}`
+		}
+	})
+
+	original := cloudProxyBaseURL
+	cloudProxyBaseURL = upstream.URL
+	t.Cleanup(func() { cloudProxyBaseURL = original })
+
+	s := &Server{}
+	router, err := s.GenerateRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := httptest.NewServer(router)
+	defer local.Close()
+
+	post := func(text string) {
+		resp, err := http.Post(local.URL+"/v1/messages", "application/json",
+			bytes.NewBufferString(imageRequestBodyWithText("glm-5.2:cloud", text)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200 for %q, got %d (%s)", text, resp.StatusCode, string(body))
+		}
+	}
+
+	// Distinct intents over the same image -> two caption calls.
+	post("describe the colors")
+	post("read the error text")
+	// Repeating the first intent -> cache hit, no new caption call.
+	post("describe the colors")
+
+	minimaxCalls := 0
+	for _, m := range *captured {
+		if m == "minimax-m3" {
+			minimaxCalls++
+		}
+	}
+	if minimaxCalls != 2 {
+		t.Fatalf("expected exactly 2 caption calls (one per distinct intent), got %d (captured: %v)", minimaxCalls, *captured)
+	}
 }

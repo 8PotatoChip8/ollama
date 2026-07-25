@@ -420,8 +420,31 @@ func proxyCloudChatWithVisionFallback(c *gin.Context, req api.ChatRequest, disab
 
 // imageCaptionPrompt asks the fallback vision model to describe an image in
 // enough detail for a text-only primary model to reason about it, including
-// verbatim transcription of any text/code/logs.
+// verbatim transcription of any text/code/logs. Used when no accompanying text
+// is available to give the captioner context.
 const imageCaptionPrompt = "Describe this image in precise detail. If it contains any text, code, logs, labels, or UI elements, transcribe them verbatim. Capture layout, colors, and relationships between elements. Be complete enough that a text-only model could answer follow-up questions about the image from your description alone."
+
+// buildCaptionInstruction builds the prompt sent to the fallback vision model
+// when captioning an image. If accompanying (the user's text that was sent in
+// the same message as the image) is non-empty, the captioner is asked to
+// describe the image with the user's intent in mind, focusing on what is
+// relevant to their request rather than narrating the whole frame generically.
+// This closes most of the gap between a native-vision primary and the
+// caption-then-primary path: the fallback sees the image with the same "why am
+// I looking at this" that the primary would have had. With no accompanying text
+// (e.g. an image returned by a tool with no text), it falls back to the generic
+// describe-everything prompt.
+func buildCaptionInstruction(accompanying string) string {
+	accompanying = strings.TrimSpace(accompanying)
+	if accompanying == "" {
+		return imageCaptionPrompt
+	}
+	var b strings.Builder
+	b.WriteString("The user sent the following message along with this image:\n\n")
+	b.WriteString(accompanying)
+	b.WriteString("\n\nDescribe this image with that intent in mind. Focus on what is relevant to the user's request, and transcribe any visible text, code, logs, labels, or UI elements verbatim. Also capture layout, colors, and the relationships between elements. Be complete enough that a text-only model could answer follow-up questions about the image from your description alone.")
+	return b.String()
+}
 
 // captionRequestImages replaces every image in req with a text caption produced
 // by the fallback vision model. It captions all images first and only mutates
@@ -430,8 +453,13 @@ const imageCaptionPrompt = "Describe this image in precise detail. If it contain
 func captionRequestImages(c *gin.Context, req *api.ChatRequest, fallbackBase, disabledOperation string) bool {
 	captions := make([][]string, len(req.Messages))
 	for i := range req.Messages {
+		// Capture the user's text that accompanied the image(s) in this message
+		// before any mutation, so the captioner can describe the image with the
+		// user's intent in mind. Content is the converted text blocks; image
+		// bytes live separately in Images.
+		accompanying := req.Messages[i].Content
 		for _, img := range req.Messages[i].Images {
-			caption, err := captionImage(c, img, fallbackBase, disabledOperation)
+			caption, err := captionImage(c, img, accompanying, fallbackBase, disabledOperation)
 			if err != nil {
 				slog.Warn("failed to caption image", "error", err)
 				return false
@@ -459,12 +487,16 @@ func captionRequestImages(c *gin.Context, req *api.ChatRequest, fallbackBase, di
 	return true
 }
 
-// captionImage returns a text description of img from the fallback vision model,
-// cached by image content hash. It issues its own cloud /api/chat request and
-// must not write to the client response.
-func captionImage(c *gin.Context, img api.ImageData, fallbackBase, disabledOperation string) (string, error) {
-	hash := hashImage(img)
-	if caption, ok := imageCaptionCache.get(hash); ok {
+// captionImage returns a text description of img from the fallback vision
+// model, cached by image content hash combined with a hash of the accompanying
+// text. Keying on both means the same image captioned under a different user
+// intent (a different question about the same screenshot) is re-captioned,
+// while the same image re-sent under the same intent across turns of a
+// stateless conversation hits the cache. It issues its own cloud /api/chat
+// request and must not write to the client response.
+func captionImage(c *gin.Context, img api.ImageData, accompanying, fallbackBase, disabledOperation string) (string, error) {
+	key := captionCacheKey(img, accompanying)
+	if caption, ok := imageCaptionCache.get(key); ok {
 		return caption, nil
 	}
 
@@ -472,7 +504,7 @@ func captionImage(c *gin.Context, img api.ImageData, fallbackBase, disabledOpera
 	captionReq := api.ChatRequest{
 		Model:    fallbackBase,
 		Stream:   &streamFalse,
-		Messages: []api.Message{{Role: "user", Content: imageCaptionPrompt, Images: []api.ImageData{img}}},
+		Messages: []api.Message{{Role: "user", Content: buildCaptionInstruction(accompanying), Images: []api.ImageData{img}}},
 	}
 	body, err := json.Marshal(captionReq)
 	if err != nil {
@@ -501,7 +533,7 @@ func captionImage(c *gin.Context, img api.ImageData, fallbackBase, disabledOpera
 		return "", errors.New("caption model returned empty description")
 	}
 
-	imageCaptionCache.put(hash, caption)
+	imageCaptionCache.put(key, caption)
 	return caption, nil
 }
 
@@ -510,8 +542,24 @@ func hashImage(img api.ImageData) string {
 	return hex.EncodeToString(h[:])
 }
 
-// imageCaptionCache stores image content hash -> caption so repeated images
-// (which reappear in every turn of a stateless conversation) are captioned once.
+// captionCacheKey returns the cache key for an image caption: the image content
+// hash, plus the hash of the accompanying user text when present. This keeps a
+// caption stable across turns (the image and its accompanying text live in a
+// fixed historical message that the client re-sends verbatim) while forcing a
+// fresh, intent-appropriate caption when the same image is sent under a
+// different user request.
+func captionCacheKey(img api.ImageData, accompanying string) string {
+	accompanying = strings.TrimSpace(accompanying)
+	if accompanying == "" {
+		return hashImage(img)
+	}
+	h := sha256.Sum256([]byte(accompanying))
+	return hashImage(img) + "|" + hex.EncodeToString(h[:])
+}
+
+// imageCaptionCache stores caption-cache-key -> caption so repeated images
+// (which reappear in every turn of a stateless conversation) are captioned once
+// per (image, user intent).
 type imageCaptionCacheType struct {
 	mu    sync.Mutex
 	cache map[string]string
