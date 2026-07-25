@@ -8,6 +8,58 @@
 
 Start building with open models.
 
+> **This is a fork** that adds cloud vision fallback for the Anthropic
+> `/v1/messages` endpoint (the one tools like Claude Code speak). See
+> [Cloud vision fallback](#cloud-vision-fallback) below.
+
+## Cloud vision fallback
+
+When you point an Anthropic-compatible client (e.g. Claude Code) at Ollama and
+use a **cloud** model (`<model>:cloud`), image inputs sent to `/v1/messages`
+fail with `400 this model does not support image input` — even when the model
+is image-capable. This happens because cloud `/v1/messages` requests are
+raw-proxied to the remote Anthropic endpoint, which does not accept Anthropic
+image content blocks for cloud models.
+
+This fork fixes that in two ways:
+
+1. **Image requests are converted, not raw-proxied.** Anthropic `/v1/messages`
+   requests that carry image content blocks are translated to Ollama `/api/chat`
+   format (which the cloud accepts) and the response is translated back to
+   Anthropic SSE. This makes image-capable cloud models actually work.
+2. **Automatic vision fallback.** If the requested model still rejects images
+   (i.e. it genuinely has no vision support), the request is retried with a
+   fallback vision model configured via the `OLLAMA_CLOUD_VISION_FALLBACK`
+   environment variable.
+
+### Configuration
+
+Set the fallback model (must be a cloud model that supports images):
+
+```shell
+OLLAMA_CLOUD_VISION_FALLBACK=minimax-m3:cloud ollama serve
+```
+
+With your main model set to e.g. `glm-5.2:cloud`, text and tool requests go
+straight to `glm-5.2:cloud` as before; image requests that `glm-5.2:cloud`
+rejects are transparently retried with `minimax-m3:cloud`.
+
+If `OLLAMA_CLOUD_VISION_FALLBACK` is unset, image-capable models still work via
+the conversion path (fix #1), and non-vision models surface the original error
+as before.
+
+### Scope and limitations
+
+- Only affects cloud (`:cloud`) models on the Anthropic `/v1/messages` path.
+  Local models and other endpoints are unchanged.
+- The fallback model must be a cloud model (the retry is proxied to cloud
+  `/api/chat`).
+- Requests that combine `web_search` tools with images take the existing
+  web-search path and are not eligible for the vision fallback.
+- Converted image requests lose some Anthropic-specific wire fidelity (e.g.
+  prompt-cache breakpoints) since they round-trip through Ollama `/api/chat`
+  format. Non-image requests keep the original raw passthrough.
+
 ## Download
 
 ### macOS

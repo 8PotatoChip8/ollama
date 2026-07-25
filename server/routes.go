@@ -2457,6 +2457,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			proxyCloudJSONRequestWithPath(c, req, "/api/chat", cloudErrRemoteInferenceUnavailable)
 			return
 		}
+		if c.GetBool(cloudAnthropicImageKey) {
+			proxyCloudChatWithVisionFallback(c, req, cloudErrRemoteInferenceUnavailable)
+			return
+		}
 		proxyCloudJSONRequest(c, req, cloudErrRemoteInferenceUnavailable)
 		return
 	}

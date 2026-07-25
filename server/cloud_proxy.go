@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
 
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/auth"
 	"github.com/ollama/ollama/envconfig"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
@@ -29,6 +30,7 @@ const (
 	defaultCloudProxySigningHost  = "ollama.com"
 	cloudProxyBaseURLEnv          = "OLLAMA_CLOUD_BASE_URL"
 	legacyCloudAnthropicKey       = "legacy_cloud_anthropic_web_search"
+	cloudAnthropicImageKey        = "cloud_anthropic_image"
 	cloudProxyClientVersionHeader = "X-Ollama-Client-Version"
 
 	// maxDecompressedBodySize limits the size of a decompressed request body
@@ -128,6 +130,20 @@ func cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 				c.Next()
 				return
 			}
+
+			// Cloud /v1/messages is raw-proxied to the remote Anthropic
+			// endpoint, which does not accept Anthropic image content blocks
+			// for cloud models (it returns "this model does not support image
+			// input", even for image-capable models). Divert image-bearing
+			// requests to the local converter path so they are translated to
+			// Ollama /api/chat format (which the cloud accepts) and the
+			// response is translated back to Anthropic SSE. This also enables
+			// the OLLAMA_CLOUD_VISION_FALLBACK retry in ChatHandler.
+			if hasAnthropicImageContent(body) {
+				c.Set(cloudAnthropicImageKey, true)
+				c.Next()
+				return
+			}
 		}
 
 		proxyCloudRequest(c, normalizedBody, disabledOperation)
@@ -177,15 +193,28 @@ func proxyCloudRequest(c *gin.Context, body []byte, disabledOperation string) {
 }
 
 func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disabledOperation string) {
+	resp, err := executeCloudProxyRequest(c, body, path, disabledOperation)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	streamCloudResponse(c, resp, path)
+}
+
+// executeCloudProxyRequest builds, signs, and sends a proxied request to the
+// cloud at the given path. The caller is responsible for closing resp.Body.
+// On a setup failure (cloud disabled, bad base URL, signing failure, transport
+// error) it writes an error response to c and returns a non-nil err.
+func executeCloudProxyRequest(c *gin.Context, body []byte, path, disabledOperation string) (*http.Response, error) {
 	if disabled, _ := internalcloud.Status(); disabled {
 		c.JSON(http.StatusForbidden, gin.H{"error": internalcloud.DisabledError(disabledOperation)})
-		return
+		return nil, errors.New(internalcloud.DisabledError(disabledOperation))
 	}
 
 	baseURL, err := url.Parse(cloudProxyBaseURL)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return nil, err
 	}
 
 	targetURL := baseURL.ResolveReference(&url.URL{
@@ -196,7 +225,7 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 	outReq, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL.String(), bytes.NewReader(body))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return nil, err
 	}
 
 	copyProxyRequestHeaders(outReq.Header, c.Request.Header)
@@ -210,7 +239,7 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 	if err := cloudProxySignRequest(outReq.Context(), outReq); err != nil {
 		slog.Warn("cloud proxy signing failed", "error", err)
 		writeCloudUnauthorized(c)
-		return
+		return nil, err
 	}
 
 	// TODO(drifkin): Add phase-specific proxy timeouts.
@@ -219,27 +248,29 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 	resp, err := http.DefaultClient.Do(outReq)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-		return
+		return nil, err
 	}
-	defer resp.Body.Close()
+	return resp, nil
+}
 
+// streamCloudResponse copies a cloud response through to the client. It applies
+// jsonl framing when proxying a 200 /api/chat response on a diverted Anthropic
+// path (legacy web_search or image), since the downstream writer
+// (WebSearchAnthropicWriter / AnthropicWriter) unmarshals one JSON value per
+// Write and the proxy copy loop may otherwise coalesce multiple jsonl records
+// into a single Write.
+func streamCloudResponse(c *gin.Context, resp *http.Response, path string) {
 	copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
 	c.Status(resp.StatusCode)
 
 	var bodyWriter http.ResponseWriter = c.Writer
 	var framedWriter *jsonlFramingResponseWriter
-	// TEMP(drifkin): only needed on the cloud-proxied first leg of Anthropic
-	// web_search fallback (which is a path we're removing soon). Local
-	// /v1/messages writes one JSON value per streamResponse callback directly
-	// into WebSearchAnthropicWriter, but this proxy copy loop may coalesce
-	// multiple jsonl records into one Write.  WebSearchAnthropicWriter currently
-	// unmarshals one JSON value per Write.
-	if path == "/api/chat" && resp.StatusCode == http.StatusOK && c.GetBool(legacyCloudAnthropicKey) {
+	if path == "/api/chat" && resp.StatusCode == http.StatusOK && (c.GetBool(legacyCloudAnthropicKey) || c.GetBool(cloudAnthropicImageKey)) {
 		framedWriter = &jsonlFramingResponseWriter{ResponseWriter: c.Writer}
 		bodyWriter = framedWriter
 	}
 
-	err = copyProxyResponseBody(bodyWriter, resp.Body)
+	err := copyProxyResponseBody(bodyWriter, resp.Body)
 	if err == nil && framedWriter != nil {
 		err = framedWriter.FlushPending()
 	}
@@ -265,6 +296,80 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 		)
 		return
 	}
+}
+
+// proxyCloudChatWithVisionFallback proxies a converted Ollama /api/chat request
+// to the cloud for a diverted Anthropic /v1/messages image request. If the
+// cloud rejects the request because the model does not support image input and
+// OLLAMA_CLOUD_VISION_FALLBACK is configured, it retries the request with the
+// fallback model and streams that response instead. With no fallback
+// configured it behaves exactly like the normal converted cloud path.
+func proxyCloudChatWithVisionFallback(c *gin.Context, req api.ChatRequest, disabledOperation string) {
+	fallback := strings.TrimSpace(envconfig.CloudVisionFallback())
+	if fallback == "" {
+		proxyCloudJSONRequestWithPath(c, req, "/api/chat", disabledOperation)
+		return
+	}
+
+	fallbackRef, err := parseAndValidateModelRef(fallback)
+	if err != nil {
+		slog.Warn("invalid OLLAMA_CLOUD_VISION_FALLBACK model, ignoring", "value", fallback, "error", err)
+		proxyCloudJSONRequestWithPath(c, req, "/api/chat", disabledOperation)
+		return
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	resp, err := executeCloudProxyRequest(c, body, "/api/chat", disabledOperation)
+	if err != nil {
+		return
+	}
+
+	// A 400 may be the "model does not support image input" rejection we want
+	// to fall back from. Buffer it so we can inspect it and, if needed, retry
+	// without having committed any response bytes to the client.
+	if resp.StatusCode == http.StatusBadRequest {
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxDecompressedBodySize))
+		resp.Body.Close()
+		if readErr != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": readErr.Error()})
+			return
+		}
+
+		if isImageNotSupportedError(errBody) {
+			slog.Info("cloud model does not support image input, retrying with vision fallback",
+				"model", req.Model, "fallback", fallbackRef.Base)
+			req.Model = fallbackRef.Base
+			body2, err := json.Marshal(req)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			resp2, err := executeCloudProxyRequest(c, body2, "/api/chat", disabledOperation)
+			if err != nil {
+				return
+			}
+			defer resp2.Body.Close()
+			streamCloudResponse(c, resp2, "/api/chat")
+			return
+		}
+
+		// Not an image rejection: surface the original error. The downstream
+		// AnthropicWriter translates non-200 bodies into Anthropic-format errors.
+		copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
+		c.Status(http.StatusBadRequest)
+		if _, err := c.Writer.Write(errBody); err != nil {
+			slog.Warn("cloud proxy error body write failed", "error", err)
+		}
+		return
+	}
+
+	defer resp.Body.Close()
+	streamCloudResponse(c, resp, "/api/chat")
 }
 
 func replaceJSONModelField(body []byte, model string) ([]byte, error) {
@@ -344,6 +449,85 @@ func hasAnthropicWebSearchTool(body []byte) bool {
 		}
 	}
 
+	return false
+}
+
+// hasAnthropicImageContent reports whether an Anthropic /v1/messages request
+// body carries any image content blocks (base64 or URL sourced). It inspects
+// both top-level message content and tool_result content blocks, since
+// clients such as Claude Code may return images from tool calls.
+func hasAnthropicImageContent(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+
+	// A content block is "image-like" if its type is "image", or if it is a
+	// tool_result whose content array contains an "image" block.
+	type contentBlock struct {
+		Type   string `json:"type"`
+		Source *struct {
+			Type string `json:"type"`
+		} `json:"source"`
+		Content []contentBlock `json:"content"`
+	}
+	var payload struct {
+		Messages []struct {
+			Content []contentBlock `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+
+	var hasImage func(blocks []contentBlock) bool
+	hasImage = func(blocks []contentBlock) bool {
+		for _, block := range blocks {
+			switch strings.TrimSpace(block.Type) {
+			case "image":
+				return true
+			case "tool_result":
+				if hasImage(block.Content) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	for _, msg := range payload.Messages {
+		if hasImage(msg.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+// isImageNotSupportedError reports whether a cloud error response body
+// indicates the requested model does not support image input. The remote
+// returns this as a 400 with a JSON {"error": "..."} body; we match a few
+// phrasings so the fallback is robust to wording changes.
+func isImageNotSupportedError(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+
+	var errData struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &errData); err != nil {
+		// Fall back to matching against the raw body.
+		errData.Error = string(body)
+	}
+
+	msg := strings.ToLower(errData.Error)
+	switch {
+	case strings.Contains(msg, "does not support image input"),
+		strings.Contains(msg, "does not support images"),
+		strings.Contains(msg, "not support image"),
+		strings.Contains(msg, "image input not supported"),
+		strings.Contains(msg, "image input is not supported"):
+		return true
+	}
 	return false
 }
 
