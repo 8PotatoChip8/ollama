@@ -26,11 +26,21 @@ This fork fixes that in two ways:
 1. **Image requests are converted, not raw-proxied.** Anthropic `/v1/messages`
    requests that carry image content blocks are translated to Ollama `/api/chat`
    format (which the cloud accepts) and the response is translated back to
-   Anthropic SSE. This makes image-capable cloud models actually work.
-2. **Automatic vision fallback.** If the requested model still rejects images
-   (i.e. it genuinely has no vision support), the request is retried with a
-   fallback vision model configured via the `OLLAMA_CLOUD_VISION_FALLBACK`
-   environment variable.
+   Anthropic SSE. This makes image-capable cloud models actually work — they
+   see the real pixels and answer directly.
+2. **Caption-then-primary for non-vision models.** If the requested model
+   rejects images (it genuinely has no vision support) and
+   `OLLAMA_CLOUD_VISION_FALLBACK` is set, the fallback vision model is used
+   only to **describe** the image (caption + transcribe any text/code). That
+   description replaces the image bytes in the conversation, and the request
+   is re-sent to your **primary** model as text. Your primary model stays the
+   brain for the whole task; the fallback is just the "eyes."
+
+Because the Anthropic Messages API is stateless, the client re-sends the full
+history (including the image) on every turn. To keep this efficient, captions
+are cached by image hash and a model that rejects images is remembered as
+non-vision — so after the first image turn, each subsequent turn is a single
+call to your primary model.
 
 ### Configuration
 
@@ -40,20 +50,31 @@ Set the fallback model (must be a cloud model that supports images):
 OLLAMA_CLOUD_VISION_FALLBACK=minimax-m3:cloud ollama serve
 ```
 
-With your main model set to e.g. `glm-5.2:cloud`, text and tool requests go
-straight to `glm-5.2:cloud` as before; image requests that `glm-5.2:cloud`
-rejects are transparently retried with `minimax-m3:cloud`.
+With your main model set to e.g. `glm-5.2:cloud`:
+
+- Text and tool requests go straight to `glm-5.2:cloud` as before.
+- Image requests are first tried on `glm-5.2:cloud` with the real pixels. If it
+  accepts (image-capable), it answers directly.
+- If `glm-5.2:cloud` rejects the image, `minimax-m3:cloud` captions it, the
+  caption replaces the image, and `glm-5.2:cloud` answers using the caption —
+  and keeps handling the rest of the task.
 
 If `OLLAMA_CLOUD_VISION_FALLBACK` is unset, image-capable models still work via
-the conversion path (fix #1), and non-vision models surface the original error
-as before.
+the conversion path, and non-vision models surface the original error as before.
 
 ### Scope and limitations
 
 - Only affects cloud (`:cloud`) models on the Anthropic `/v1/messages` path.
   Local models and other endpoints are unchanged.
-- The fallback model must be a cloud model (the retry is proxied to cloud
-  `/api/chat`).
+- The fallback model must be a cloud model that supports images (it is asked to
+  caption the image via cloud `/api/chat`).
+- Captioning is **lossy**: the primary model sees the fallback's text
+  description of the image, not the pixels. For screenshots of text/code/logs
+  the caption transcribes them verbatim, so little is lost; for fine visual or
+  pixel-precise reasoning, some detail may be lost. (Image-capable primaries
+  are never captioned — they get the real pixels.)
+- If captioning fails, the turn degrades gracefully: the fallback model answers
+  the image turn directly.
 - Requests that combine `web_search` tools with images take the existing
   web-search path and are not eligible for the vision fallback.
 - Converted image requests lose some Anthropic-specific wire fidelity (e.g.

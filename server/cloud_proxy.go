@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -195,6 +198,7 @@ func proxyCloudRequest(c *gin.Context, body []byte, disabledOperation string) {
 func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disabledOperation string) {
 	resp, err := executeCloudProxyRequest(c, body, path, disabledOperation)
 	if err != nil {
+		respondCloudProxyError(c, err, disabledOperation)
 		return
 	}
 	defer resp.Body.Close()
@@ -203,18 +207,17 @@ func proxyCloudRequestWithPath(c *gin.Context, body []byte, path string, disable
 
 // executeCloudProxyRequest builds, signs, and sends a proxied request to the
 // cloud at the given path. The caller is responsible for closing resp.Body.
-// On a setup failure (cloud disabled, bad base URL, signing failure, transport
-// error) it writes an error response to c and returns a non-nil err.
+// It does not write to c on failure; callers should pass the returned error to
+// respondCloudProxyError (or handle it themselves for sub-requests that must not
+// touch the client response).
 func executeCloudProxyRequest(c *gin.Context, body []byte, path, disabledOperation string) (*http.Response, error) {
 	if disabled, _ := internalcloud.Status(); disabled {
-		c.JSON(http.StatusForbidden, gin.H{"error": internalcloud.DisabledError(disabledOperation)})
-		return nil, errors.New(internalcloud.DisabledError(disabledOperation))
+		return nil, errCloudDisabled
 	}
 
 	baseURL, err := url.Parse(cloudProxyBaseURL)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return nil, err
+		return nil, fmt.Errorf("invalid cloud base url: %w", err)
 	}
 
 	targetURL := baseURL.ResolveReference(&url.URL{
@@ -224,8 +227,7 @@ func executeCloudProxyRequest(c *gin.Context, body []byte, path, disabledOperati
 
 	outReq, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL.String(), bytes.NewReader(body))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return nil, err
+		return nil, fmt.Errorf("build cloud request: %w", err)
 	}
 
 	copyProxyRequestHeaders(outReq.Header, c.Request.Header)
@@ -238,8 +240,7 @@ func executeCloudProxyRequest(c *gin.Context, body []byte, path, disabledOperati
 
 	if err := cloudProxySignRequest(outReq.Context(), outReq); err != nil {
 		slog.Warn("cloud proxy signing failed", "error", err)
-		writeCloudUnauthorized(c)
-		return nil, err
+		return nil, errCloudSigning
 	}
 
 	// TODO(drifkin): Add phase-specific proxy timeouts.
@@ -247,11 +248,32 @@ func executeCloudProxyRequest(c *gin.Context, body []byte, path, disabledOperati
 	// we should not enforce a short total timeout for long-lived responses.
 	resp, err := http.DefaultClient.Do(outReq)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errCloudTransport, err)
 	}
 	return resp, nil
 }
+
+// respondCloudProxyError writes the appropriate client response for an
+// executeCloudProxyRequest setup failure, mirroring the original per-case
+// status codes (403 disabled, 401 signing, 502 transport, 500 otherwise).
+func respondCloudProxyError(c *gin.Context, err error, disabledOperation string) {
+	switch {
+	case errors.Is(err, errCloudDisabled):
+		c.JSON(http.StatusForbidden, gin.H{"error": internalcloud.DisabledError(disabledOperation)})
+	case errors.Is(err, errCloudSigning):
+		writeCloudUnauthorized(c)
+	case errors.Is(err, errCloudTransport):
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	}
+}
+
+var (
+	errCloudDisabled  = errors.New("cloud features disabled")
+	errCloudSigning   = errors.New("cloud proxy signing failed")
+	errCloudTransport = errors.New("cloud proxy request failed")
+)
 
 // streamCloudResponse copies a cloud response through to the client. It applies
 // jsonl framing when proxying a 200 /api/chat response on a diverted Anthropic
@@ -299,11 +321,24 @@ func streamCloudResponse(c *gin.Context, resp *http.Response, path string) {
 }
 
 // proxyCloudChatWithVisionFallback proxies a converted Ollama /api/chat request
-// to the cloud for a diverted Anthropic /v1/messages image request. If the
-// cloud rejects the request because the model does not support image input and
-// OLLAMA_CLOUD_VISION_FALLBACK is configured, it retries the request with the
-// fallback model and streams that response instead. With no fallback
-// configured it behaves exactly like the normal converted cloud path.
+// to the cloud for a diverted Anthropic /v1/messages image request.
+//
+// Behavior:
+//   - With no OLLAMA_CLOUD_VISION_FALLBACK configured, the request (images and
+//     all) goes to the primary model. An image-capable primary handles it; a
+//     non-vision primary rejects it and the error surfaces.
+//   - With a fallback configured, the primary is tried first with the real
+//     image bytes. If it accepts (image-capable primary), its response is
+//     streamed. If it rejects with "does not support image input", the fallback
+//     model is used only to caption each image (cached by image hash); the
+//     captions replace the image bytes in the conversation and the request is
+//     re-sent to the primary as text. This keeps the primary as the brain for
+//     the whole task while letting a non-vision primary "see" images via the
+//     caption. The primary is remembered as non-vision so later turns skip the
+//     doomed first attempt, and captions are cached so later turns are a single
+//     primary call.
+//   - If captioning fails, the original image request is sent to the fallback
+//     model as a graceful degradation so the turn still gets an answer.
 func proxyCloudChatWithVisionFallback(c *gin.Context, req api.ChatRequest, disabledOperation string) {
 	fallback := strings.TrimSpace(envconfig.CloudVisionFallback())
 	if fallback == "" {
@@ -318,21 +353,34 @@ func proxyCloudChatWithVisionFallback(c *gin.Context, req api.ChatRequest, disab
 		return
 	}
 
-	body, err := json.Marshal(req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	// Try the primary with the real image bytes first, unless we already know
+	// it cannot handle images. This lets image-capable primaries see the
+	// pixels directly (no lossy caption).
+	if !nonVisionModels.isNonVision(req.Model) {
+		body, err := json.Marshal(req)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		resp, err := executeCloudProxyRequest(c, body, "/api/chat", disabledOperation)
+		if err != nil {
+			respondCloudProxyError(c, err, disabledOperation)
+			return
+		}
 
-	resp, err := executeCloudProxyRequest(c, body, "/api/chat", disabledOperation)
-	if err != nil {
-		return
-	}
+		if resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			streamCloudResponse(c, resp, "/api/chat")
+			return
+		}
 
-	// A 400 may be the "model does not support image input" rejection we want
-	// to fall back from. Buffer it so we can inspect it and, if needed, retry
-	// without having committed any response bytes to the client.
-	if resp.StatusCode == http.StatusBadRequest {
+		if resp.StatusCode != http.StatusBadRequest {
+			defer resp.Body.Close()
+			streamCloudResponse(c, resp, "/api/chat")
+			return
+		}
+
+		// 400: buffer it so we can inspect and retry without committing bytes.
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxDecompressedBodySize))
 		resp.Body.Close()
 		if readErr != nil {
@@ -340,36 +388,192 @@ func proxyCloudChatWithVisionFallback(c *gin.Context, req api.ChatRequest, disab
 			return
 		}
 
-		if isImageNotSupportedError(errBody) {
-			slog.Info("cloud model does not support image input, retrying with vision fallback",
-				"model", req.Model, "fallback", fallbackRef.Base)
-			req.Model = fallbackRef.Base
-			body2, err := json.Marshal(req)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
+		if !isImageNotSupportedError(errBody) {
+			// Unrelated 400: surface it (AnthropicWriter translates non-200).
+			copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
+			c.Status(http.StatusBadRequest)
+			if _, err := c.Writer.Write(errBody); err != nil {
+				slog.Warn("cloud proxy error body write failed", "error", err)
 			}
-			resp2, err := executeCloudProxyRequest(c, body2, "/api/chat", disabledOperation)
-			if err != nil {
-				return
-			}
-			defer resp2.Body.Close()
-			streamCloudResponse(c, resp2, "/api/chat")
 			return
 		}
 
-		// Not an image rejection: surface the original error. The downstream
-		// AnthropicWriter translates non-200 bodies into Anthropic-format errors.
-		copyProxyResponseHeaders(c.Writer.Header(), resp.Header)
-		c.Status(http.StatusBadRequest)
-		if _, err := c.Writer.Write(errBody); err != nil {
-			slog.Warn("cloud proxy error body write failed", "error", err)
-		}
+		// Primary rejected the image. Remember so later turns skip this attempt.
+		nonVisionModels.mark(req.Model)
+		slog.Info("cloud model does not support image input, captioning via fallback then retrying primary",
+			"model", req.Model, "fallback", fallbackRef.Base)
+		// Fall through to caption-then-primary below.
+	}
+
+	// Caption every image (cached), replace image bytes with caption text, and
+	// re-send to the primary as text. On caption failure, degrade to letting
+	// the fallback model answer this turn directly.
+	if !captionRequestImages(c, &req, fallbackRef.Base, disabledOperation) {
+		slog.Warn("image captioning failed, degrading to vision fallback model for this turn", "fallback", fallbackRef.Base)
+		req.Model = fallbackRef.Base
+		proxyCloudJSONRequestWithPath(c, req, "/api/chat", disabledOperation)
 		return
 	}
 
+	proxyCloudJSONRequestWithPath(c, req, "/api/chat", disabledOperation)
+}
+
+// imageCaptionPrompt asks the fallback vision model to describe an image in
+// enough detail for a text-only primary model to reason about it, including
+// verbatim transcription of any text/code/logs.
+const imageCaptionPrompt = "Describe this image in precise detail. If it contains any text, code, logs, labels, or UI elements, transcribe them verbatim. Capture layout, colors, and relationships between elements. Be complete enough that a text-only model could answer follow-up questions about the image from your description alone."
+
+// captionRequestImages replaces every image in req with a text caption produced
+// by the fallback vision model. It captions all images first and only mutates
+// req once every caption succeeds, so a failure leaves req unchanged. Returns
+// false (with req unmodified) if any image could not be captioned.
+func captionRequestImages(c *gin.Context, req *api.ChatRequest, fallbackBase, disabledOperation string) bool {
+	captions := make([][]string, len(req.Messages))
+	for i := range req.Messages {
+		for _, img := range req.Messages[i].Images {
+			caption, err := captionImage(c, img, fallbackBase, disabledOperation)
+			if err != nil {
+				slog.Warn("failed to caption image", "error", err)
+				return false
+			}
+			captions[i] = append(captions[i], caption)
+		}
+	}
+
+	for i := range req.Messages {
+		if len(captions[i]) == 0 {
+			continue
+		}
+		var b strings.Builder
+		for _, caption := range captions[i] {
+			b.WriteString("[The user attached an image. A vision model (")
+			b.WriteString(fallbackBase)
+			b.WriteString(") described it as: ")
+			b.WriteString(caption)
+			b.WriteString("]\n")
+		}
+		b.WriteString(req.Messages[i].Content)
+		req.Messages[i].Content = b.String()
+		req.Messages[i].Images = nil
+	}
+	return true
+}
+
+// captionImage returns a text description of img from the fallback vision model,
+// cached by image content hash. It issues its own cloud /api/chat request and
+// must not write to the client response.
+func captionImage(c *gin.Context, img api.ImageData, fallbackBase, disabledOperation string) (string, error) {
+	hash := hashImage(img)
+	if caption, ok := imageCaptionCache.get(hash); ok {
+		return caption, nil
+	}
+
+	streamFalse := false
+	captionReq := api.ChatRequest{
+		Model:    fallbackBase,
+		Stream:   &streamFalse,
+		Messages: []api.Message{{Role: "user", Content: imageCaptionPrompt, Images: []api.ImageData{img}}},
+	}
+	body, err := json.Marshal(captionReq)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := executeCloudProxyRequest(c, body, "/api/chat", disabledOperation)
+	if err != nil {
+		return "", err
+	}
 	defer resp.Body.Close()
-	streamCloudResponse(c, resp, "/api/chat")
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("caption model %q returned status %d", fallbackBase, resp.StatusCode)
+	}
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxDecompressedBodySize))
+	if err != nil {
+		return "", err
+	}
+	var chatResp api.ChatResponse
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		return "", fmt.Errorf("decode caption response: %w", err)
+	}
+	caption := strings.TrimSpace(chatResp.Message.Content)
+	if caption == "" {
+		return "", errors.New("caption model returned empty description")
+	}
+
+	imageCaptionCache.put(hash, caption)
+	return caption, nil
+}
+
+func hashImage(img api.ImageData) string {
+	h := sha256.Sum256(img)
+	return hex.EncodeToString(h[:])
+}
+
+// imageCaptionCache stores image content hash -> caption so repeated images
+// (which reappear in every turn of a stateless conversation) are captioned once.
+type imageCaptionCacheType struct {
+	mu    sync.Mutex
+	cache map[string]string
+}
+
+var imageCaptionCache = &imageCaptionCacheType{cache: make(map[string]string)}
+
+const maxImageCaptionCacheEntries = 256
+
+func (cc *imageCaptionCacheType) get(hash string) (string, bool) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	v, ok := cc.cache[hash]
+	return v, ok
+}
+
+func (cc *imageCaptionCacheType) put(hash, caption string) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if len(cc.cache) >= maxImageCaptionCacheEntries {
+		// Bound memory by evicting an arbitrary entry.
+		for k := range cc.cache {
+			delete(cc.cache, k)
+			break
+		}
+	}
+	cc.cache[hash] = caption
+}
+
+func (cc *imageCaptionCacheType) clear() {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.cache = make(map[string]string)
+}
+
+// nonVisionModels records primary models that rejected image input, so later
+// image-bearing turns skip the doomed first attempt and go straight to
+// caption-then-primary.
+type nonVisionCacheType struct {
+	mu  sync.Mutex
+	set map[string]struct{}
+}
+
+var nonVisionModels = &nonVisionCacheType{set: make(map[string]struct{})}
+
+func (n *nonVisionCacheType) isNonVision(model string) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	_, ok := n.set[model]
+	return ok
+}
+
+func (n *nonVisionCacheType) mark(model string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.set[model] = struct{}{}
+}
+
+func (n *nonVisionCacheType) clear() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.set = make(map[string]struct{})
 }
 
 func replaceJSONModelField(body []byte, model string) ([]byte, error) {
