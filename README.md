@@ -105,6 +105,33 @@ With your main model set to e.g. `glm-5.2:cloud`:
 If `OLLAMA_CLOUD_VISION_FALLBACK` is unset, image-capable models still work via
 the conversion path, and non-vision models surface the original error as before.
 
+### Per-launch fallback (`--fallback`)
+
+`OLLAMA_CLOUD_VISION_FALLBACK` is a **server-wide** setting: every client of one
+`ollama serve` shares the same fallback. To pick the fallback **per launch** —
+for example to run two Claude Code sessions at once with different
+primary/fallback pairs against a single server — use the `--fallback` flag with
+`ollama launch`:
+
+```shell
+ollama launch claude --model glm-5.2:cloud --fallback minimax-m3:cloud
+```
+
+This starts a small localhost reverse proxy for that launch only, which forwards
+to the Ollama server and tags each request with an
+`X-Ollama-Cloud-Vision-Fallback` header. The server reads that header per
+request and uses it as the fallback **instead of** the env var, so each launch
+gets its own isolated fallback with no cross-talk. The proxy is stopped when the
+launch exits.
+
+- `--fallback` requires talking to a server that has the vision-fallback feature
+  (this fork). Point `ollama launch` at it with `OLLAMA_HOST`, e.g.
+  `OLLAMA_HOST=127.0.0.1:11435 ollama launch claude --model glm-5.2:cloud --fallback minimax-m3:cloud`.
+- `OLLAMA_CLOUD_VISION_FALLBACK` remains the server-wide default when `--fallback`
+  is absent; `--fallback` overrides it for that launch only.
+- Only the `claude` integration implements `--fallback` today; other integrations
+  ignore it.
+
 ### Scope and limitations
 
 - Only affects cloud (`:cloud`) models on the Anthropic `/v1/messages` path.

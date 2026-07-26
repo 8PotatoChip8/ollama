@@ -342,6 +342,12 @@ func streamCloudResponse(c *gin.Context, resp *http.Response, path string) {
 //     model as a graceful degradation so the turn still gets an answer.
 func proxyCloudChatWithVisionFallback(c *gin.Context, req api.ChatRequest, disabledOperation string) {
 	fallback := strings.TrimSpace(envconfig.CloudVisionFallback())
+	// A per-launch fallback (set via `ollama launch --fallback`, conveyed as a
+	// request header by the launch shim) overrides the server-wide env var so
+	// concurrent launches can use different fallbacks against one server.
+	if h := strings.TrimSpace(c.GetHeader("X-Ollama-Cloud-Vision-Fallback")); h != "" {
+		fallback = h
+	}
 	if fallback == "" {
 		proxyCloudJSONRequestWithPath(c, req, "/api/chat", disabledOperation)
 		return
@@ -349,7 +355,7 @@ func proxyCloudChatWithVisionFallback(c *gin.Context, req api.ChatRequest, disab
 
 	fallbackRef, err := parseAndValidateModelRef(fallback)
 	if err != nil {
-		slog.Warn("invalid OLLAMA_CLOUD_VISION_FALLBACK model, ignoring", "value", fallback, "error", err)
+		slog.Warn("invalid cloud vision fallback model, ignoring", "value", fallback, "error", err)
 		proxyCloudJSONRequestWithPath(c, req, "/api/chat", disabledOperation)
 		return
 	}

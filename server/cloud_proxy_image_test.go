@@ -961,3 +961,70 @@ func TestCloudVisionFallback_CacheKeysOnAccompanyingText(t *testing.T) {
 		t.Fatalf("expected exactly 2 caption calls (one per distinct intent), got %d (captured: %v)", minimaxCalls, *captured)
 	}
 }
+
+// TestCloudVisionFallback_HeaderOverridesEnvVar verifies that a per-launch
+// fallback conveyed via the X-Ollama-Cloud-Vision-Fallback header takes
+// precedence over the server-wide OLLAMA_CLOUD_VISION_FALLBACK env var, so
+// concurrent launches against one server can use different fallbacks. The env
+// var names minimax-m3:cloud but the header names qwen-vl:cloud; the captioner
+// must be called with qwen-vl, not minimax-m3.
+func TestCloudVisionFallback_HeaderOverridesEnvVar(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+	resetVisionCaches()
+
+	t.Setenv("OLLAMA_CLOUD_VISION_FALLBACK", "minimax-m3:cloud")
+
+	upstream, captured := newImageFallbackUpstream(t, func(model string, call int) (int, string) {
+		switch model {
+		case "glm-5.2":
+			if call == 0 {
+				return http.StatusBadRequest, `{"error":"this model does not support image input"}`
+			}
+			return http.StatusOK, `{"message":{"role":"assistant","content":"it is a cat"},"done":true}`
+		case "qwen-vl":
+			return http.StatusOK, `{"message":{"role":"assistant","content":"a cat on a mat"},"done":true}`
+		case "minimax-m3":
+			// If the env var won, the captioner would be minimax-m3 — fail loudly.
+			return http.StatusBadRequest, `{"error":"env var fallback should not have been used"}`
+		default:
+			return http.StatusBadRequest, `{"error":"unexpected model ` + model + `"}`
+		}
+	})
+
+	original := cloudProxyBaseURL
+	cloudProxyBaseURL = upstream.URL
+	t.Cleanup(func() { cloudProxyBaseURL = original })
+
+	s := &Server{}
+	router, err := s.GenerateRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := httptest.NewServer(router)
+	defer local.Close()
+
+	req, err := http.NewRequest(http.MethodPost, local.URL+"/v1/messages", bytes.NewBufferString(imageRequestBody("glm-5.2:cloud")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Ollama-Cloud-Vision-Fallback", "qwen-vl:cloud")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+	}
+	// Reactive path (generic /api/show reports no capabilities): primary-pixels
+	// 400, then captioner, then primary answer. The captioner (index 1) must be
+	// the header's model, not the env var's.
+	got := *captured
+	if len(got) != 3 || got[0] != "glm-5.2" || got[1] != "qwen-vl" || got[2] != "glm-5.2" {
+		t.Fatalf("expected upstream calls [glm-5.2, qwen-vl, glm-5.2] (header overrides env var), got %v", got)
+	}
+}

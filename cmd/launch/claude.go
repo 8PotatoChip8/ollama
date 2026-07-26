@@ -13,9 +13,17 @@ import (
 )
 
 // Claude implements Runner for Claude Code integration.
-type Claude struct{}
+type Claude struct {
+	fallback string
+}
 
 func (c *Claude) String() string { return "Claude Code" }
+
+// SetVisionFallback selects the cloud vision fallback model for this launch.
+// It satisfies VisionFallbackRunner so `ollama launch claude --fallback` can
+// route image input through a vision-capable cloud model without a server-wide
+// setting.
+func (c *Claude) SetVisionFallback(model string) { c.fallback = model }
 
 func (c *Claude) args(model string, extra []string) []string {
 	var args []string
@@ -55,18 +63,32 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 		return err
 	}
 
+	// When a per-launch vision fallback is set, route Claude Code through a
+	// localhost shim that injects the fallback as a per-request header, so the
+	// server uses this launch's fallback instead of the server-wide env var.
+	// Each launch gets its own shim on its own port (concurrent-safe).
+	baseURL := envconfig.Host().String()
+	if c.fallback != "" {
+		if shimURL, stop, err := startVisionFallbackShim(c.fallback); err == nil {
+			baseURL = shimURL
+			defer stop()
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: could not start vision fallback proxy (using default base URL): %v\n", err)
+		}
+	}
+
 	cmd := exec.Command(claudePath, c.args(model, args)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	cmd.Env = append(os.Environ(), c.envVars(model)...)
+	cmd.Env = append(os.Environ(), c.envVars(model, baseURL)...)
 	return cmd.Run()
 }
 
-func (c *Claude) envVars(model string) []string {
+func (c *Claude) envVars(model, baseURL string) []string {
 	env := []string{
-		"ANTHROPIC_BASE_URL=" + envconfig.Host().String(),
+		"ANTHROPIC_BASE_URL=" + baseURL,
 		"ANTHROPIC_API_KEY=",
 		"ANTHROPIC_AUTH_TOKEN=ollama",
 		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",

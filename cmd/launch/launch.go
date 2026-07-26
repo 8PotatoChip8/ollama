@@ -124,6 +124,7 @@ func (p LaunchPolicy) missingModelPolicy() missingModelPolicy {
 type IntegrationLaunchRequest struct {
 	Name                 string
 	ModelOverride        string
+	Fallback             string
 	ForceConfigure       bool
 	ConfigureOnly        bool
 	Restore              bool
@@ -143,6 +144,14 @@ var isInteractiveSession = func() bool {
 type Runner interface {
 	Run(model string, models []LaunchModel, args []string) error
 	String() string
+}
+
+// VisionFallbackRunner is implemented by integrations that can select a
+// per-launch cloud vision fallback model (e.g. a vision-capable cloud model used
+// to caption images for a non-vision primary). It is optional; integrations that
+// don't implement it ignore --fallback.
+type VisionFallbackRunner interface {
+	SetVisionFallback(model string)
 }
 
 // Editor can edit config files for integrations that support model configuration.
@@ -273,6 +282,7 @@ type SelectionItem struct {
 // The runTUI callback is called when the root launcher UI should be shown.
 func LaunchCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) error, runTUI func(cmd *cobra.Command)) *cobra.Command {
 	var modelFlag string
+	var fallbackFlag string
 	var configFlag bool
 	var yesFlag bool
 	var restoreFlag bool
@@ -369,6 +379,10 @@ Examples:
 				}
 			}
 
+			if fallbackFlag != "" && !isCloudModelName(fallbackFlag) {
+				fmt.Fprintf(os.Stderr, "Warning: --fallback %s does not look like a cloud model; vision fallback may not work\n", fallbackFlag)
+			}
+
 			headlessYes := yesFlag && !isInteractiveSession()
 			forceConfigure := configFlag || (modelFlag == "" && !headlessYes)
 			if forceConfigure && !configFlag && modelFlag == "" {
@@ -381,6 +395,7 @@ Examples:
 			err := LaunchIntegration(cmd.Context(), IntegrationLaunchRequest{
 				Name:           name,
 				ModelOverride:  modelFlag,
+				Fallback:       fallbackFlag,
 				ForceConfigure: forceConfigure,
 				ConfigureOnly:  configFlag,
 				Restore:        restoreFlag,
@@ -395,6 +410,7 @@ Examples:
 	}
 
 	cmd.Flags().StringVar(&modelFlag, "model", "", "Model to use")
+	cmd.Flags().StringVar(&fallbackFlag, "fallback", "", "Cloud vision fallback model for this launch (e.g. minimax-m3:cloud)")
 	cmd.Flags().BoolVar(&configFlag, "config", false, "Configure without launching")
 	cmd.Flags().BoolVar(&restoreFlag, "restore", false, "Restore an integration to its default profile")
 	cmd.Flags().BoolVarP(&yesFlag, "yes", "y", false, "Automatically answer yes to confirmation prompts")
@@ -844,7 +860,7 @@ func (c *launcherClient) launchManagedSingleIntegration(ctx context.Context, nam
 		return nil
 	}
 
-	return runIntegration(runner, target, c.resolveRunModels(ctx, []string{target}), req.ExtraArgs)
+	return runIntegration(runner, target, c.resolveRunModels(ctx, []string{target}), req.ExtraArgs, req.Fallback)
 }
 
 func (c *launcherClient) launchManagedAutodiscoveryIntegration(ctx context.Context, name string, runner Runner, autodiscovery ManagedAutodiscoveryIntegration, saved *config.IntegrationConfig, req IntegrationLaunchRequest) error {
@@ -887,7 +903,7 @@ func (c *launcherClient) launchManagedAutodiscoveryIntegration(ctx context.Conte
 		return nil
 	}
 
-	return runIntegration(runner, target, c.resolveRunModels(ctx, []string{target}), req.ExtraArgs)
+	return runIntegration(runner, target, c.resolveRunModels(ctx, []string{target}), req.ExtraArgs, req.Fallback)
 }
 
 func (c *launcherClient) managedAutodiscoveryUsable(ctx context.Context, autodiscovery ManagedAutodiscoveryIntegration) bool {
@@ -1455,7 +1471,10 @@ func (c *launcherClient) resolveRunModels(ctx context.Context, models []string) 
 	return c.modelInventory().Resolve(ctx, models)
 }
 
-func runIntegration(runner Runner, modelName string, models []LaunchModel, args []string) error {
+func runIntegration(runner Runner, modelName string, models []LaunchModel, args []string, fallback string) error {
+	if vfr, ok := runner.(VisionFallbackRunner); ok && fallback != "" {
+		vfr.SetVisionFallback(fallback)
+	}
 	if len(models) == 0 && modelName != "" {
 		models = launchModelsFromNames([]string{modelName})
 	}
@@ -1475,7 +1494,7 @@ func launchAfterConfiguration(name string, runner Runner, model string, models [
 	if err := EnsureIntegrationInstalled(name, runner); err != nil {
 		return err
 	}
-	return runIntegration(runner, model, models, req.ExtraArgs)
+	return runIntegration(runner, model, models, req.ExtraArgs, req.Fallback)
 }
 
 func loadStoredIntegrationConfig(name string) (*config.IntegrationConfig, error) {

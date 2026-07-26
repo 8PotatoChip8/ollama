@@ -347,7 +347,7 @@ func TestClaudeEnvVars(t *testing.T) {
 		return m
 	}
 
-	got := envMap(c.envVars("llama3.2"))
+	got := envMap(c.envVars("llama3.2", envconfig.Host().String()))
 	for key, want := range map[string]string{
 		"ANTHROPIC_BASE_URL":                  envconfig.Host().String(),
 		"ANTHROPIC_API_KEY":                   "",
@@ -371,6 +371,51 @@ func TestClaudeEnvVars(t *testing.T) {
 		if _, ok := got[key]; ok {
 			t.Errorf("%s must not be set by Ollama", key)
 		}
+	}
+}
+
+// TestClaudeEnvVars_BaseURL verifies envVars routes Claude Code through the
+// provided base URL (the vision-fallback shim when --fallback is set), rather
+// than always baking in envconfig.Host().
+func TestClaudeEnvVars_BaseURL(t *testing.T) {
+	c := &Claude{}
+
+	envMap := func(envs []string) map[string]string {
+		m := make(map[string]string)
+		for _, e := range envs {
+			k, v, _ := strings.Cut(e, "=")
+			m[k] = v
+		}
+		return m
+	}
+
+	t.Run("uses provided base URL", func(t *testing.T) {
+		shimURL := "http://127.0.0.1:54321"
+		got := envMap(c.envVars("glm-5.2:cloud", shimURL))
+		if got["ANTHROPIC_BASE_URL"] != shimURL {
+			t.Errorf("ANTHROPIC_BASE_URL = %q, want %q", got["ANTHROPIC_BASE_URL"], shimURL)
+		}
+	})
+
+	t.Run("defaults to envconfig.Host when no base URL override", func(t *testing.T) {
+		got := envMap(c.envVars("llama3.2", envconfig.Host().String()))
+		if got["ANTHROPIC_BASE_URL"] != envconfig.Host().String() {
+			t.Errorf("ANTHROPIC_BASE_URL = %q, want %q", got["ANTHROPIC_BASE_URL"], envconfig.Host().String())
+		}
+	})
+}
+
+// TestClaudeSetVisionFallback verifies Claude implements VisionFallbackRunner so
+// `ollama launch claude --fallback` can set a per-launch fallback.
+func TestClaudeSetVisionFallback(t *testing.T) {
+	c := &Claude{}
+
+	var vfr VisionFallbackRunner = c // compile-time: Claude satisfies the interface
+	_ = vfr
+
+	c.SetVisionFallback("minimax-m3:cloud")
+	if c.fallback != "minimax-m3:cloud" {
+		t.Errorf("fallback = %q, want minimax-m3:cloud", c.fallback)
 	}
 }
 
