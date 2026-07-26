@@ -31,8 +31,9 @@ This fork fixes that in two ways:
    they see the real pixels and answer directly.
 2. **Caption-then-primary for non-vision models.** If the requested model
    rejects images (it genuinely has no vision support) and
-   `OLLAMA_CLOUD_VISION_FALLBACK` is set, the fallback vision model is used
-   only to **describe** the image (caption + transcribe any text/code). That
+   `OLLAMA_CLOUD_VISION_FALLBACK` is set, the fallback vision model reads the
+   image at full pixel fidelity — exactly as if it were the primary — and is
+   used only to **describe** it (caption + transcribe any text/code). That
    description replaces the image bytes in the conversation, and the request
    is re-sent to your **primary** model as text. Your primary model stays the
    brain for the whole task; the fallback is just the "eyes."
@@ -67,8 +68,11 @@ With your main model set to e.g. `glm-5.2:cloud`:
 - Text and tool requests go straight to `glm-5.2:cloud` as before.
 - Image requests are first tried on `glm-5.2:cloud` with the real pixels. If it
   accepts (image-capable), it answers directly.
-- If `glm-5.2:cloud` rejects the image, `minimax-m3:cloud` captions it, the
-  caption replaces the image, and `glm-5.2:cloud` answers using the caption —
+- If `glm-5.2:cloud` rejects the image, `minimax-m3:cloud` reads the image at
+  full pixel fidelity — exactly as if it were the primary model — with the
+  user's accompanying text as context so it knows why it's being shown the
+  image. It writes a caption the way a vision model would, that caption
+  replaces the image bytes, and `glm-5.2:cloud` continues from the caption —
   and keeps handling the rest of the task.
 
 If `OLLAMA_CLOUD_VISION_FALLBACK` is unset, image-capable models still work via
