@@ -88,15 +88,19 @@ OLLAMA_CLOUD_VISION_FALLBACK=minimax-m3:cloud ollama serve
 With your main model set to e.g. `glm-5.2:cloud`:
 
 - Text and tool requests go straight to `glm-5.2:cloud` as before.
-- Image requests are first tried on `glm-5.2:cloud` with the real pixels. If it
-  accepts (image-capable), it answers directly.
-- If `glm-5.2:cloud` rejects the image, `minimax-m3:cloud` is routed the same
-  request the primary would have received up to the image — the system prompt,
-  prior turns, and the image — exactly as if it were the primary model. It
-  reads the image at full pixel fidelity with that full context, writes a
-  caption the way a vision model would, that caption replaces the image bytes,
-  and `glm-5.2:cloud` continues from the caption — and keeps handling the rest
-  of the task.
+- On the first image request, the fork reads `glm-5.2:cloud`'s declared
+  capabilities from `/api/show`. Since it reports no `vision` capability, the
+  fork skips the doomed "send the pixels to glm-5.2:cloud and eat the 400" step
+  and goes straight to captioning. (`/api/show`'s capabilities are absent or
+  don't list `vision`? It falls back to trying the primary with the real pixels
+  first and catching the 400 — image-capable primaries then answer directly with
+  no captioning.)
+- `minimax-m3:cloud` is routed the same request the primary would have received
+  up to the image — the system prompt, prior turns, and the image — exactly as
+  if it were the primary model. It reads the image at full pixel fidelity with
+  that full context, writes a caption the way a vision model would, that caption
+  replaces the image bytes, and `glm-5.2:cloud` continues from the caption — and
+  keeps handling the rest of the task.
 
 If `OLLAMA_CLOUD_VISION_FALLBACK` is unset, image-capable models still work via
 the conversion path, and non-vision models surface the original error as before.
