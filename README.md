@@ -58,12 +58,16 @@ across turns (only the turns *after* it grow), so the cache key is stable and
 later turns hit it; a different conversation, or the same image asked about
 under a different intent, yields a different key and is re-captioned.
 
-If the conversation up to the image is larger than the fallback's context
-window, the oldest non-system turns are dropped — preserving the system prompt
-and the image-bearing message — and the request is retried until it fits. This
-mirrors how a real primary would have had its history compacted by the client as
-it neared the window, so the captioner still sees the image with as much of the
-intended context as fits.
+The fallback's context window is read from `/api/show` (the model's
+`context_length`) and cached. If a conservative estimate of the conversation up
+to the image exceeds that window, the oldest non-system turns are dropped —
+preserving the system prompt and the image-bearing message — *before* sending,
+so the captioner sees as much of the intended context as fits in a single call.
+(The image is always the last message in the caption context, so it is never
+dropped.) Cloud models don't expose a tokenizer, so the estimate is approximate;
+a reactive trim-on-overflow retry backs it up if the cloud still reports the
+context is too long. This mirrors how a real primary would have had its history
+compacted by the client as it neared the window.
 
 ### Configuration
 

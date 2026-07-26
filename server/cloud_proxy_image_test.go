@@ -80,6 +80,7 @@ func imageRequestBodyWithText(model, text string) string {
 func resetVisionCaches() {
 	imageCaptionCache.clear()
 	nonVisionModels.clear()
+	cloudContextLengthCache.clear()
 }
 
 // newImageFallbackUpstream returns a mock cloud server. respond is invoked with
@@ -91,6 +92,14 @@ func newImageFallbackUpstream(t *testing.T, respond func(model string, call int)
 	var captured []string
 	counts := map[string]int{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			// No context_length in model_info -> captioner treats the window as
+			// unknown and skips proactive trimming (falls back to reactive retry).
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"model_info":{"test.arch":"x"}}`))
+			return
+		}
 		payload, _ := io.ReadAll(r.Body)
 		var req struct {
 			Model string `json:"model"`
@@ -124,6 +133,12 @@ func newImageFallbackUpstreamCapturing(t *testing.T, respond func(model string, 
 	var captured []capturedReq
 	counts := map[string]int{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"model_info":{"test.arch":"x"}}`))
+			return
+		}
 		payload, _ := io.ReadAll(r.Body)
 		var req struct {
 			Model    string `json:"model"`
@@ -519,6 +534,14 @@ func TestCloudVisionFallback_CaptionTrimsOnContextOverflow(t *testing.T) {
 	var minimaxMsgCounts []int
 	var lastMinimaxContents []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			// No context_length -> proactive trim skipped, so the reactive
+			// trim-on-overflow retry is exercised ([4,3,2]).
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"model_info":{"test.arch":"x"}}`))
+			return
+		}
 		payload, _ := io.ReadAll(r.Body)
 		var req struct {
 			Model    string `json:"model"`
@@ -599,6 +622,107 @@ func TestCloudVisionFallback_CaptionTrimsOnContextOverflow(t *testing.T) {
 	for i, want := range wantLast {
 		if lastMinimaxContents[i] != want {
 			t.Fatalf("final caption request message %d = %q, want %q (system/image not preserved: %v)", i, lastMinimaxContents[i], want, lastMinimaxContents)
+		}
+	}
+}
+
+// TestCloudVisionFallback_CaptionProactivelyTrims verifies that when /api/show
+// reports the fallback's context window, the captioner proactively trims the
+// conversation to fit that window BEFORE sending — so a too-large context is
+// handled in a single caption call (no reactive retries). The mock reports a
+// tiny window (50 tokens); the rich 4-message request's estimate exceeds it, so
+// it is trimmed down to system + image message and sent once.
+func TestCloudVisionFallback_CaptionProactivelyTrims(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+	resetVisionCaches()
+
+	t.Setenv("OLLAMA_CLOUD_VISION_FALLBACK", "minimax-m3:cloud")
+
+	counts := map[string]int{}
+	var minimaxMsgCounts []int
+	var lastMinimaxContents []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			// Report a tiny context window so proactive trimming kicks in.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"model_info":{"test.context_length":50}}`))
+			return
+		}
+		payload, _ := io.ReadAll(r.Body)
+		var req struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(payload, &req)
+		n := counts[req.Model]
+		counts[req.Model] = n + 1
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Model {
+		case "glm-5.2":
+			if n == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"this model does not support image input"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"answered"},"done":true}`))
+		case "minimax-m3":
+			minimaxMsgCounts = append(minimaxMsgCounts, len(req.Messages))
+			lastMinimaxContents = nil
+			for _, m := range req.Messages {
+				lastMinimaxContents = append(lastMinimaxContents, m.Content)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"caption"},"done":true}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"unexpected model ` + req.Model + `"}`))
+		}
+	}))
+	defer upstream.Close()
+
+	original := cloudProxyBaseURL
+	cloudProxyBaseURL = upstream.URL
+	t.Cleanup(func() { cloudProxyBaseURL = original })
+
+	s := &Server{}
+	router, err := s.GenerateRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := httptest.NewServer(router)
+	defer local.Close()
+
+	resp, err := http.Post(local.URL+"/v1/messages", "application/json",
+		bytes.NewBufferString(imageRequestBodyRich("glm-5.2:cloud")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "answered") {
+		t.Fatalf("expected primary answer in body, got %q", string(body))
+	}
+	// Proactively trimmed to system + image message in a single caption call —
+	// no reactive retries.
+	if got := minimaxMsgCounts; len(got) != 1 || got[0] != 2 {
+		t.Fatalf("expected a single proactive caption call with 2 messages (system + image), got %v", got)
+	}
+	wantLast := []string{"You are a debugging assistant.", "what error is shown in this screenshot?"}
+	if len(lastMinimaxContents) != len(wantLast) {
+		t.Fatalf("proactive caption request should carry system + image message, got %v", lastMinimaxContents)
+	}
+	for i, want := range wantLast {
+		if lastMinimaxContents[i] != want {
+			t.Fatalf("proactive caption request message %d = %q, want %q (system/image not preserved: %v)", i, lastMinimaxContents[i], want, lastMinimaxContents)
 		}
 	}
 }

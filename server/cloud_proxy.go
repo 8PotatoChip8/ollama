@@ -503,6 +503,21 @@ func captionMessageInContext(c *gin.Context, req *api.ChatRequest, msgIdx int, f
 	// cache key is taken from the full context, so later turns (which re-send
 	// that same fixed history) still hit the cache after the same trim.
 	msgs := contextMsgs
+	// Proactively trim the conversation to the fallback's context window before
+	// sending, so we don't rely on the cloud's default/truncation behavior. The
+	// image-bearing message is the last in contextMsgs, so it is never dropped;
+	// the system prompt (if present) is also kept. Cloud models don't expose a
+	// tokenizer, so this uses a conservative estimate; the reactive
+	// trim-on-overflow retry below handles any underestimate.
+	if ctxLen := cloudModelContextLength(c, fallbackBase, disabledOperation); ctxLen > 0 {
+		for estimateContextTokens(msgs) > ctxLen {
+			next, ok := dropOldestNonSystem(msgs)
+			if !ok {
+				break
+			}
+			msgs = next
+		}
+	}
 	var caption string
 	for {
 		captionReq := api.ChatRequest{
@@ -686,6 +701,84 @@ func (n *nonVisionCacheType) clear() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.set = make(map[string]struct{})
+}
+
+// cloudContextLengthCache memoizes cloud models' context window sizes (in
+// tokens) read from /api/show, so the captioner can size the caption request
+// without re-fetching per turn.
+type cloudContextLengthCacheType struct {
+	mu    sync.Mutex
+	cache map[string]int
+}
+
+var cloudContextLengthCache = &cloudContextLengthCacheType{cache: make(map[string]int)}
+
+func (cl *cloudContextLengthCacheType) get(model string) (int, bool) {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	v, ok := cl.cache[model]
+	return v, ok
+}
+
+func (cl *cloudContextLengthCacheType) put(model string, n int) {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	cl.cache[model] = n
+}
+
+func (cl *cloudContextLengthCacheType) clear() {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	cl.cache = make(map[string]int)
+}
+
+// cloudModelContextLength returns the cloud model's context window size in
+// tokens, read from /api/show (model_info's <arch>.context_length) and cached
+// per model. Returns 0 if it can't be determined (call failure or missing
+// field); callers treat 0 as "unknown" and skip context-length-dependent
+// logic, falling back to the reactive trim-on-overflow retry.
+func cloudModelContextLength(c *gin.Context, model, disabledOperation string) int {
+	if n, ok := cloudContextLengthCache.get(model); ok {
+		return n
+	}
+	n := 0
+	if body, err := json.Marshal(api.ShowRequest{Model: model}); err == nil {
+		if resp, err := executeCloudProxyRequest(c, body, "/api/show", disabledOperation); err == nil {
+			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxDecompressedBodySize))
+			resp.Body.Close()
+			var show api.ShowResponse
+			if json.Unmarshal(respBody, &show) == nil {
+				for k, v := range show.ModelInfo {
+					if !strings.HasSuffix(k, ".context_length") {
+						continue
+					}
+					if iv, ok := v.(float64); ok && int(iv) > n {
+						n = int(iv)
+					}
+				}
+			}
+		}
+	}
+	cloudContextLengthCache.put(model, n)
+	return n
+}
+
+// estimateContextTokens returns a rough token-count estimate for a sequence of
+// messages, used to decide whether to proactively trim the caption context
+// before sending. Cloud models don't expose a tokenizer (/api/tokenize returns
+// 404 for cloud), so this is a conservative byte-level heuristic: ~4 text bytes
+// per token plus a flat per-image allowance. It only needs to catch clearly
+// oversized contexts; the reactive trim-on-overflow retry handles any
+// underestimate.
+func estimateContextTokens(msgs []api.Message) int {
+	const bytesPerToken = 4
+	const tokensPerImage = 1024
+	n := 0
+	for _, m := range msgs {
+		n += len(m.Content) / bytesPerToken
+		n += len(m.Images) * tokensPerImage
+	}
+	return n
 }
 
 func replaceJSONModelField(body []byte, model string) ([]byte, error) {
