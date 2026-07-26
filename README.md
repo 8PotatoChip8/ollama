@@ -69,6 +69,14 @@ a reactive trim-on-overflow retry backs it up if the cloud still reports the
 context is too long. This mirrors how a real primary would have had its history
 compacted by the client as it neared the window.
 
+The primary's vision capability is also read from `/api/show` (the model's
+declared `capabilities`) and cached. When the primary reports no `vision`
+capability, the doomed "try the primary with pixels, eat the 400, then caption"
+first turn is skipped entirely — the fork goes straight to caption-then-primary,
+saving a wasted failing call. (The reactive try-and-catch-400 path remains as
+the safety net for when `/api/show` doesn't report capabilities or the metadata
+is wrong.)
+
 ### Configuration
 
 Set the fallback model (must be a cloud model that supports images):
