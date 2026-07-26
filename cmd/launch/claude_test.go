@@ -347,7 +347,7 @@ func TestClaudeEnvVars(t *testing.T) {
 		return m
 	}
 
-	got := envMap(c.envVars("llama3.2"))
+	got := envMap(c.envVars("llama3.2", envconfig.Host().String()))
 	for key, want := range map[string]string{
 		"ANTHROPIC_BASE_URL":                  envconfig.Host().String(),
 		"ANTHROPIC_API_KEY":                   "",
@@ -372,6 +372,22 @@ func TestClaudeEnvVars(t *testing.T) {
 			t.Errorf("%s must not be set by Ollama", key)
 		}
 	}
+}
+
+func TestClaudeEnvVarsUsesProxyBaseURL(t *testing.T) {
+	c := &Claude{}
+	c.SetVisionFallback("minimax-m3:cloud")
+
+	// implements VisionFallbackRunner
+	var _ VisionFallbackRunner = c
+
+	got := c.envVars("glm-5.2:cloud", "http://127.0.0.1:54321")
+	for _, e := range got {
+		if e == "ANTHROPIC_BASE_URL=http://127.0.0.1:54321" {
+			return
+		}
+	}
+	t.Errorf("envVars with a proxy base URL did not set ANTHROPIC_BASE_URL to it; got %v", got)
 }
 
 func TestClaudeModelEnvVars(t *testing.T) {

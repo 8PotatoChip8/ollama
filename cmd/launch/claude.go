@@ -13,9 +13,17 @@ import (
 )
 
 // Claude implements Runner for Claude Code integration.
-type Claude struct{}
+type Claude struct {
+	fallback string
+}
 
 func (c *Claude) String() string { return "Claude Code" }
+
+// SetVisionFallback configures a vision-capable cloud model to caption images
+// for a non-vision primary. When set, Run starts a localhost proxy that
+// intercepts image-bearing /v1/messages requests and routes them through the
+// fallback, then points Claude Code at that proxy.
+func (c *Claude) SetVisionFallback(model string) { c.fallback = model }
 
 func (c *Claude) args(model string, extra []string) []string {
 	var args []string
@@ -55,18 +63,30 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 		return err
 	}
 
+	baseURL := envconfig.Host().String()
+	if c.fallback != "" {
+		proxyURL, stop, err := startVisionFallbackProxy(model, c.fallback)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not start vision fallback proxy, continuing without it: %v\n", err)
+		} else {
+			defer stop()
+			baseURL = proxyURL
+			fmt.Fprintf(os.Stderr, "Vision fallback enabled: captioning images via %s before sending to %s\n", c.fallback, model)
+		}
+	}
+
 	cmd := exec.Command(claudePath, c.args(model, args)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	cmd.Env = append(os.Environ(), c.envVars(model)...)
+	cmd.Env = append(os.Environ(), c.envVars(model, baseURL)...)
 	return cmd.Run()
 }
 
-func (c *Claude) envVars(model string) []string {
+func (c *Claude) envVars(model, baseURL string) []string {
 	env := []string{
-		"ANTHROPIC_BASE_URL=" + envconfig.Host().String(),
+		"ANTHROPIC_BASE_URL=" + baseURL,
 		"ANTHROPIC_API_KEY=",
 		"ANTHROPIC_AUTH_TOKEN=ollama",
 		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",

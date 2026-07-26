@@ -67,6 +67,24 @@ ollama launch claude
 
 Supported integrations include [Claude Code](https://docs.ollama.com/integrations/claude-code), [Codex](https://docs.ollama.com/integrations/codex), [Copilot CLI](https://docs.ollama.com/integrations/copilot-cli), [Droid](https://docs.ollama.com/integrations/droid), and [OpenCode](https://docs.ollama.com/integrations/opencode).
 
+#### Vision fallback
+
+Some cloud models don't support image input. `--fallback` lets you pair a
+non-vision primary with a vision-capable cloud model that captions images on
+its behalf, so the primary stays the brain for the whole task:
+
+```
+ollama launch claude --model glm-5.2:cloud --fallback minimax-m3:cloud
+```
+
+When a request carries an image, the launch starts a local proxy that routes
+the image (with the full conversation up to it) to the fallback for a caption,
+swaps the image for the caption text, and re-sends the request to the primary.
+Vision-capable primaries pass through natively — no captioning, no loss of
+fidelity. Each launch runs its own proxy on its own port, so concurrent
+launches with different fallbacks don't interfere. Only the `claude`
+integration implements `--fallback` today.
+
 ### AI assistant
 
 Use [OpenClaw](https://docs.ollama.com/integrations/openclaw) to turn Ollama into a personal AI assistant across WhatsApp, Telegram, Slack, Discord, and more:
