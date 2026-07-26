@@ -25,9 +25,10 @@ This fork fixes that in two ways:
 
 1. **Image requests are converted, not raw-proxied.** Anthropic `/v1/messages`
    requests that carry image content blocks are translated to Ollama `/api/chat`
-   format (which the cloud accepts) and the response is translated back to
-   Anthropic SSE. This makes image-capable cloud models actually work — they
-   see the real pixels and answer directly.
+   format (which the cloud accepts) and the response is translated back to the
+   Anthropic response format (SSE for streaming requests, a single message
+   object otherwise). This makes image-capable cloud models actually work —
+   they see the real pixels and answer directly.
 2. **Caption-then-primary for non-vision models.** If the requested model
    rejects images (it genuinely has no vision support) and
    `OLLAMA_CLOUD_VISION_FALLBACK` is set, the fallback vision model is used
