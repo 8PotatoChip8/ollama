@@ -25,6 +25,7 @@ import (
 	"github.com/ollama/ollama/auth"
 	"github.com/ollama/ollama/envconfig"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
+	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
 )
 
@@ -355,8 +356,21 @@ func proxyCloudChatWithVisionFallback(c *gin.Context, req api.ChatRequest, disab
 
 	// Try the primary with the real image bytes first, unless we already know
 	// it cannot handle images. This lets image-capable primaries see the
-	// pixels directly (no lossy caption).
-	if !nonVisionModels.isNonVision(req.Model) {
+	// pixels directly (no lossy caption). We know the primary can't handle
+	// images either from a prior rejection (nonVisionModels) or proactively
+	// from /api/show reporting no vision capability — the proactive check
+	// avoids a wasted doomed attempt on the first image turn. When /api/show
+	// doesn't report capabilities we fall back to trying and catching the 400.
+	primaryNonVision := nonVisionModels.isNonVision(req.Model)
+	if !primaryNonVision {
+		if caps, known := cloudModelCapabilities(c, req.Model, disabledOperation); known && !hasCapability(caps, model.CapabilityVision) {
+			primaryNonVision = true
+			nonVisionModels.mark(req.Model)
+			slog.Info("cloud model has no vision capability, captioning via fallback then retrying primary",
+				"model", req.Model, "fallback", fallbackRef.Base)
+		}
+	}
+	if !primaryNonVision {
 		body, err := json.Marshal(req)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -703,45 +717,53 @@ func (n *nonVisionCacheType) clear() {
 	n.set = make(map[string]struct{})
 }
 
-// cloudContextLengthCache memoizes cloud models' context window sizes (in
-// tokens) read from /api/show, so the captioner can size the caption request
-// without re-fetching per turn.
-type cloudContextLengthCacheType struct {
-	mu    sync.Mutex
-	cache map[string]int
+// cloudModelInfo holds the bits of /api/show the vision-fallback path needs:
+// the model's context window (tokens) and its declared capabilities.
+type cloudModelInfo struct {
+	contextLength int
+	capabilities  []model.Capability
 }
 
-var cloudContextLengthCache = &cloudContextLengthCacheType{cache: make(map[string]int)}
+// cloudModelInfoCache memoizes /api/show results per model so the captioner can
+// size/trim the caption request and decide whether the primary can handle
+// images without re-fetching per turn.
+type cloudModelInfoCacheType struct {
+	mu    sync.Mutex
+	cache map[string]cloudModelInfo
+}
 
-func (cl *cloudContextLengthCacheType) get(model string) (int, bool) {
+var cloudModelInfoCache = &cloudModelInfoCacheType{cache: make(map[string]cloudModelInfo)}
+
+func (cl *cloudModelInfoCacheType) get(model string) (cloudModelInfo, bool) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 	v, ok := cl.cache[model]
 	return v, ok
 }
 
-func (cl *cloudContextLengthCacheType) put(model string, n int) {
+func (cl *cloudModelInfoCacheType) put(model string, info cloudModelInfo) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
-	cl.cache[model] = n
+	cl.cache[model] = info
 }
 
-func (cl *cloudContextLengthCacheType) clear() {
+func (cl *cloudModelInfoCacheType) clear() {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
-	cl.cache = make(map[string]int)
+	cl.cache = make(map[string]cloudModelInfo)
 }
 
-// cloudModelContextLength returns the cloud model's context window size in
-// tokens, read from /api/show (model_info's <arch>.context_length) and cached
-// per model. Returns 0 if it can't be determined (call failure or missing
-// field); callers treat 0 as "unknown" and skip context-length-dependent
-// logic, falling back to the reactive trim-on-overflow retry.
-func cloudModelContextLength(c *gin.Context, model, disabledOperation string) int {
-	if n, ok := cloudContextLengthCache.get(model); ok {
-		return n
+// fetchCloudModelInfo reads /api/show for a cloud model and extracts its context
+// window (model_info's <arch>.context_length) and declared capabilities. The
+// second return is false when the call failed or produced no usable info, so
+// callers can fall back to reactive behavior rather than acting on stale/empty
+// metadata.
+func fetchCloudModelInfo(c *gin.Context, model, disabledOperation string) (cloudModelInfo, bool) {
+	if info, ok := cloudModelInfoCache.get(model); ok {
+		return info, true
 	}
-	n := 0
+	info := cloudModelInfo{}
+	ok := false
 	if body, err := json.Marshal(api.ShowRequest{Model: model}); err == nil {
 		if resp, err := executeCloudProxyRequest(c, body, "/api/show", disabledOperation); err == nil {
 			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxDecompressedBodySize))
@@ -752,15 +774,48 @@ func cloudModelContextLength(c *gin.Context, model, disabledOperation string) in
 					if !strings.HasSuffix(k, ".context_length") {
 						continue
 					}
-					if iv, ok := v.(float64); ok && int(iv) > n {
-						n = int(iv)
+					if iv, ok := v.(float64); ok && int(iv) > info.contextLength {
+						info.contextLength = int(iv)
 					}
 				}
+				info.capabilities = show.Capabilities
+				// "known" means /api/show actually reported a capability list we
+				// can trust; an absent/empty list (or a failed call) leaves the
+				// caller on the reactive try-and-catch-400 path.
+				ok = len(show.Capabilities) > 0
 			}
 		}
 	}
-	cloudContextLengthCache.put(model, n)
-	return n
+	cloudModelInfoCache.put(model, info)
+	return info, ok
+}
+
+// cloudModelContextLength returns the cloud model's context window size in
+// tokens (0 if unknown); callers treat 0 as "unknown" and skip
+// context-length-dependent logic, falling back to the reactive
+// trim-on-overflow retry.
+func cloudModelContextLength(c *gin.Context, model, disabledOperation string) int {
+	info, _ := fetchCloudModelInfo(c, model, disabledOperation)
+	return info.contextLength
+}
+
+// cloudModelCapabilities returns the cloud model's declared capabilities and
+// whether /api/show reported them. When known is false the caller should fall
+// back to the reactive try-and-catch-400 behavior rather than trusting an empty
+// capability list.
+func cloudModelCapabilities(c *gin.Context, model, disabledOperation string) ([]model.Capability, bool) {
+	info, known := fetchCloudModelInfo(c, model, disabledOperation)
+	return info.capabilities, known
+}
+
+// hasCapability reports whether caps contains cap.
+func hasCapability(caps []model.Capability, cap model.Capability) bool {
+	for _, c := range caps {
+		if c == cap {
+			return true
+		}
+	}
+	return false
 }
 
 // estimateContextTokens returns a rough token-count estimate for a sequence of

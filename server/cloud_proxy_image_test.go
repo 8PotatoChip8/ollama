@@ -80,7 +80,7 @@ func imageRequestBodyWithText(model, text string) string {
 func resetVisionCaches() {
 	imageCaptionCache.clear()
 	nonVisionModels.clear()
-	cloudContextLengthCache.clear()
+	cloudModelInfoCache.clear()
 }
 
 // newImageFallbackUpstream returns a mock cloud server. respond is invoked with
@@ -215,6 +215,173 @@ func TestCloudVisionFallback_CaptionsThenPrimary(t *testing.T) {
 	}
 	if got := *captured; len(got) != 3 || got[0] != "glm-5.2" || got[1] != "minimax-m3" || got[2] != "glm-5.2" {
 		t.Fatalf("expected upstream calls [glm-5.2, minimax-m3, glm-5.2], got %v", got)
+	}
+}
+
+// TestCloudVisionFallback_ProactiveCapabilitySkipsPrimaryPixels verifies that
+// when /api/show reports the primary has no vision capability, the doomed
+// primary-with-pixels attempt is skipped entirely: the fallback captions and
+// the primary answers, with no wasted first 400 call. Upstream /api/chat calls:
+// minimax-m3, glm-5.2 (two, not three).
+func TestCloudVisionFallback_ProactiveCapabilitySkipsPrimaryPixels(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+	resetVisionCaches()
+
+	t.Setenv("OLLAMA_CLOUD_VISION_FALLBACK", "minimax-m3:cloud")
+
+	var captured []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			payload, _ := io.ReadAll(r.Body)
+			var sr struct {
+				Model string `json:"model"`
+			}
+			_ = json.Unmarshal(payload, &sr)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			switch sr.Model {
+			case "glm-5.2":
+				// Primary declares NO vision capability.
+				_, _ = w.Write([]byte(`{"model_info":{"glm5.2.context_length":1000000},"capabilities":["completion","tools","thinking"]}`))
+			case "minimax-m3":
+				_, _ = w.Write([]byte(`{"model_info":{"minimax-m3.context_length":524288},"capabilities":["completion","tools","thinking","vision"]}`))
+			default:
+				_, _ = w.Write([]byte(`{"model_info":{}}`))
+			}
+			return
+		}
+		payload, _ := io.ReadAll(r.Body)
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(payload, &req)
+		captured = append(captured, req.Model)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Model {
+		case "glm-5.2":
+			// Primary is only called once here (to answer after captioning),
+			// since the proactive capability check skipped the pixels attempt.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"answered"},"done":true}`))
+		case "minimax-m3":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"a red square"},"done":true}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"unexpected model ` + req.Model + `"}`))
+		}
+	}))
+	defer upstream.Close()
+
+	original := cloudProxyBaseURL
+	cloudProxyBaseURL = upstream.URL
+	t.Cleanup(func() { cloudProxyBaseURL = original })
+
+	s := &Server{}
+	router, err := s.GenerateRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := httptest.NewServer(router)
+	defer local.Close()
+
+	resp, err := http.Post(local.URL+"/v1/messages", "application/json", bytes.NewBufferString(imageRequestBody("glm-5.2:cloud")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "answered") {
+		t.Fatalf("expected primary answer in body, got %q", string(body))
+	}
+	// No doomed primary-pixels call: only [minimax-m3 (caption), glm-5.2 (answer)].
+	if got := captured; len(got) != 2 || got[0] != "minimax-m3" || got[1] != "glm-5.2" {
+		t.Fatalf("expected upstream /api/chat calls [minimax-m3, glm-5.2] (proactive skip), got %v", got)
+	}
+	if !nonVisionModels.isNonVision("glm-5.2") {
+		t.Fatal("primary with no vision capability should be marked non-vision proactively")
+	}
+}
+
+// TestCloudVisionFallback_ProactiveCapabilityAllowsVisionPrimary verifies the
+// flip side: when /api/show reports the primary HAS vision capability, the
+// proactive check lets it through to see the real pixels and answer directly
+// (one call, no captioning, not marked non-vision).
+func TestCloudVisionFallback_ProactiveCapabilityAllowsVisionPrimary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+	resetVisionCaches()
+
+	t.Setenv("OLLAMA_CLOUD_VISION_FALLBACK", "minimax-m3:cloud")
+
+	var captured []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			payload, _ := io.ReadAll(r.Body)
+			var sr struct {
+				Model string `json:"model"`
+			}
+			_ = json.Unmarshal(payload, &sr)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			switch sr.Model {
+			case "llama3.2-vision":
+				_, _ = w.Write([]byte(`{"model_info":{"llama3.2-vision.context_length":131072},"capabilities":["completion","tools","vision"]}`))
+			default:
+				_, _ = w.Write([]byte(`{"model_info":{}}`))
+			}
+			return
+		}
+		payload, _ := io.ReadAll(r.Body)
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(payload, &req)
+		captured = append(captured, req.Model)
+		w.Header().Set("Content-Type", "application/json")
+		if req.Model != "llama3.2-vision" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"unexpected model ` + req.Model + `"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"a cat"},"done":true}`))
+	}))
+	defer upstream.Close()
+
+	original := cloudProxyBaseURL
+	cloudProxyBaseURL = upstream.URL
+	t.Cleanup(func() { cloudProxyBaseURL = original })
+
+	s := &Server{}
+	router, err := s.GenerateRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := httptest.NewServer(router)
+	defer local.Close()
+
+	resp, err := http.Post(local.URL+"/v1/messages", "application/json", bytes.NewBufferString(imageRequestBody("llama3.2-vision:cloud")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "a cat") {
+		t.Fatalf("expected direct answer in body, got %q", string(body))
+	}
+	if got := captured; len(got) != 1 || got[0] != "llama3.2-vision" {
+		t.Fatalf("expected a single direct primary call, got %v", got)
+	}
+	if nonVisionModels.isNonVision("llama3.2-vision") {
+		t.Fatal("vision-capable primary should not be marked non-vision")
 	}
 }
 
