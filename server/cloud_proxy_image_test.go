@@ -22,6 +22,7 @@ func TestHasAnthropicImageContent(t *testing.T) {
 		{name: "string content blocks", body: `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`, want: false},
 		{name: "image block", body: `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"what?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`, want: true},
 		{name: "image in tool_result", body: `{"model":"m","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}`, want: true},
+		{name: "image after string-content turns", body: `{"model":"m","system":"s","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"},{"role":"user","content":[{"type":"text","text":"what?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`, want: true},
 		{name: "image url source", body: `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]}`, want: true},
 		{name: "empty body", body: ``, want: false},
 		{name: "invalid json", body: `{not json`, want: false},
@@ -107,16 +108,17 @@ func newImageFallbackUpstream(t *testing.T, respond func(model string, call int)
 	return srv, &captured
 }
 
-// capturedReq records a single upstream request's model and first message
-// content, so tests can assert what the captioner was asked.
+// capturedReq records a single upstream request's model and the contents of
+// every message it carried, so tests can assert what the captioner was given.
 type capturedReq struct {
-	Model   string
-	Content string
+	Model    string
+	Contents []string
 }
 
 // newImageFallbackUpstreamCapturing is like newImageFallbackUpstream but also
-// records the first message content of each request, so tests can verify the
-// caption request carries the user's accompanying text.
+// records the content of every message in each request, so tests can verify
+// the caption request carries the full conversation context (system prompt +
+// prior turns + the image-bearing message), not just the image.
 func newImageFallbackUpstreamCapturing(t *testing.T, respond func(model string, call int) (int, string)) (*httptest.Server, *[]capturedReq) {
 	t.Helper()
 	var captured []capturedReq
@@ -131,11 +133,11 @@ func newImageFallbackUpstreamCapturing(t *testing.T, respond func(model string, 
 			} `json:"messages"`
 		}
 		_ = json.Unmarshal(payload, &req)
-		content := ""
-		if len(req.Messages) > 0 {
-			content = req.Messages[0].Content
+		contents := make([]string, len(req.Messages))
+		for i, m := range req.Messages {
+			contents[i] = m.Content
 		}
-		captured = append(captured, capturedReq{Model: req.Model, Content: content})
+		captured = append(captured, capturedReq{Model: req.Model, Contents: contents})
 		n := counts[req.Model]
 		counts[req.Model] = n + 1
 		status, body := respond(req.Model, n)
@@ -406,10 +408,27 @@ func TestCloudPassthroughMiddleware_DivertsImageRequests(t *testing.T) {
 	})
 }
 
+// imageRequestBodyRich is an Anthropic /v1/messages request with a system
+// prompt and a prior user/assistant turn before the image-bearing user turn,
+// so tests can verify the captioner receives the full conversation context up
+// to the image — exactly as if the fallback were the primary model.
+func imageRequestBodyRich(model string) string {
+	return `{"model":"` + model + `","max_tokens":1024,"stream":false,` +
+		`"system":"You are a debugging assistant.",` +
+		`"messages":[` +
+		`{"role":"user","content":"Let's debug an error together."},` +
+		`{"role":"assistant","content":"Sure, share what you're seeing."},` +
+		`{"role":"user","content":[` +
+		`{"type":"text","text":"what error is shown in this screenshot?"},` +
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}` +
+		`]}]}`
+}
+
 // TestCloudVisionFallback_CaptionUsesRequestContext verifies that the caption
-// request sent to the fallback vision model includes the user's accompanying
-// text, so the captioner describes the image with the user's intent in mind
-// rather than as a context-free "describe everything" prompt.
+// request sent to the fallback vision model carries the full conversation up
+// to the image — the system prompt, prior turns, and the image-bearing message
+// — exactly as if the fallback were the primary model, so its caption reflects
+// the full task context rather than a context-free "describe everything" prompt.
 func TestCloudVisionFallback_CaptionUsesRequestContext(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setTestHome(t, t.TempDir())
@@ -444,7 +463,7 @@ func TestCloudVisionFallback_CaptionUsesRequestContext(t *testing.T) {
 	defer local.Close()
 
 	resp, err := http.Post(local.URL+"/v1/messages", "application/json",
-		bytes.NewBufferString(imageRequestBodyWithText("glm-5.2:cloud", "what error is shown in this screenshot?")))
+		bytes.NewBufferString(imageRequestBodyRich("glm-5.2:cloud")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +474,8 @@ func TestCloudVisionFallback_CaptionUsesRequestContext(t *testing.T) {
 	}
 
 	// Find the caption request (the one sent to the fallback model) and assert
-	// it carries the user's accompanying text.
+	// it carries the full conversation context: system, prior user, prior
+	// assistant, and the image-bearing user message.
 	var captionReq *capturedReq
 	for i := range *captured {
 		if (*captured)[i].Model == "minimax-m3" {
@@ -466,8 +486,120 @@ func TestCloudVisionFallback_CaptionUsesRequestContext(t *testing.T) {
 	if captionReq == nil {
 		t.Fatalf("expected a caption request to minimax-m3, got %v", *captured)
 	}
-	if !strings.Contains(captionReq.Content, "what error is shown in this screenshot?") {
-		t.Fatalf("caption request should include the user's accompanying text, got %q", captionReq.Content)
+	wantContents := []string{
+		"You are a debugging assistant.",
+		"Let's debug an error together.",
+		"Sure, share what you're seeing.",
+		"what error is shown in this screenshot?",
+	}
+	if len(captionReq.Contents) != len(wantContents) {
+		t.Fatalf("caption request should carry %d messages (full context), got %d: %v", len(wantContents), len(captionReq.Contents), captionReq.Contents)
+	}
+	for i, want := range wantContents {
+		if captionReq.Contents[i] != want {
+			t.Fatalf("caption request message %d = %q, want %q (full context not passed: %v)", i, captionReq.Contents[i], want, captionReq.Contents)
+		}
+	}
+}
+
+// TestCloudVisionFallback_CaptionTrimsOnContextOverflow verifies that when the
+// fallback's context window is smaller than the conversation up to the image,
+// the captioner progressively drops the oldest non-system turns — preserving the
+// system prompt and the image-bearing message — and retries until the request
+// fits, then returns a caption. The fallback here only accepts system + image
+// (2 messages); the rich request has 4, so it must trim twice before succeeding.
+func TestCloudVisionFallback_CaptionTrimsOnContextOverflow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+	resetVisionCaches()
+
+	t.Setenv("OLLAMA_CLOUD_VISION_FALLBACK", "minimax-m3:cloud")
+
+	counts := map[string]int{}
+	var minimaxMsgCounts []int
+	var lastMinimaxContents []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := io.ReadAll(r.Body)
+		var req struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(payload, &req)
+		n := counts[req.Model]
+		counts[req.Model] = n + 1
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Model {
+		case "glm-5.2":
+			if n == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"this model does not support image input"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"answered"},"done":true}`))
+		case "minimax-m3":
+			minimaxMsgCounts = append(minimaxMsgCounts, len(req.Messages))
+			lastMinimaxContents = nil
+			for _, m := range req.Messages {
+				lastMinimaxContents = append(lastMinimaxContents, m.Content)
+			}
+			// Fallback "context window" fits only system + image (2 messages).
+			if len(req.Messages) > 2 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"context length exceeded"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"caption"},"done":true}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"unexpected model ` + req.Model + `"}`))
+		}
+	}))
+	defer upstream.Close()
+
+	original := cloudProxyBaseURL
+	cloudProxyBaseURL = upstream.URL
+	t.Cleanup(func() { cloudProxyBaseURL = original })
+
+	s := &Server{}
+	router, err := s.GenerateRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := httptest.NewServer(router)
+	defer local.Close()
+
+	resp, err := http.Post(local.URL+"/v1/messages", "application/json",
+		bytes.NewBufferString(imageRequestBodyRich("glm-5.2:cloud")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after trimming, got %d (%s)", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "answered") {
+		t.Fatalf("expected primary answer in body, got %q", string(body))
+	}
+	// 4 messages -> reject, 3 -> reject, 2 (system + image) -> succeed.
+	if got := minimaxMsgCounts; len(got) != 3 || got[0] != 4 || got[1] != 3 || got[2] != 2 {
+		t.Fatalf("expected minimax calls with message counts [4,3,2], got %v", got)
+	}
+	// The final (successful) caption request must still carry the system prompt
+	// and the image-bearing message — never the dropped middle turns.
+	wantLast := []string{"You are a debugging assistant.", "what error is shown in this screenshot?"}
+	if len(lastMinimaxContents) != len(wantLast) {
+		t.Fatalf("final caption request should carry system + image message, got %v", lastMinimaxContents)
+	}
+	for i, want := range wantLast {
+		if lastMinimaxContents[i] != want {
+			t.Fatalf("final caption request message %d = %q, want %q (system/image not preserved: %v)", i, lastMinimaxContents[i], want, lastMinimaxContents)
+		}
 	}
 }
 

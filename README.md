@@ -38,22 +38,32 @@ This fork fixes that in two ways:
    is re-sent to your **primary** model as text. Your primary model stays the
    brain for the whole task; the fallback is just the "eyes."
 
-   The caption is **context-aware**: the fallback is given the user's text that
-   accompanied the image (e.g. "what's causing this error in the screenshot?"),
-   so it describes the image with the user's intent in mind — focusing on what
-   is relevant to the request and transcribing the relevant text/code/labels —
-   rather than narrating the whole frame generically. (When an image arrives
-   with no accompanying text, e.g. from a tool, a generic describe-everything
-   prompt is used.)
+   The caption is **context-aware**: rather than synthesizing a "describe this
+   image" prompt, the fallback is routed the **same request the primary would
+   have received up to the image** — the system prompt, all prior turns, and the
+   image-bearing message, with only the model swapped to the fallback. In other
+   words, the fallback sees the image with exactly the context a native vision
+   model would have had at the moment the image was introduced, so its caption
+   reflects the full task (it knows *why* it's being shown the image) instead of
+   narrating the whole frame generically. That caption replaces the image bytes,
+   and the primary continues from it.
 
 Because the Anthropic Messages API is stateless, the client re-sends the full
 history (including the image) on every turn. To keep this efficient, captions
-are cached by image hash **plus the accompanying text**, and a model that
-rejects images is remembered as non-vision — so after the first image turn,
-each subsequent turn is a single call to your primary model. Keying the cache
-on the accompanying text means the same screenshot asked about under a
-different intent is re-captioned, while the same image re-sent under the same
-intent across turns hits the cache.
+are cached by a hash of the **full conversation context up to the image**
+(every message's text and image bytes), and a model that rejects images is
+remembered as non-vision — so after the first image turn, each subsequent turn
+is a single call to your primary model. That history up to the image is fixed
+across turns (only the turns *after* it grow), so the cache key is stable and
+later turns hit it; a different conversation, or the same image asked about
+under a different intent, yields a different key and is re-captioned.
+
+If the conversation up to the image is larger than the fallback's context
+window, the oldest non-system turns are dropped — preserving the system prompt
+and the image-bearing message — and the request is retried until it fits. This
+mirrors how a real primary would have had its history compacted by the client as
+it neared the window, so the captioner still sees the image with as much of the
+intended context as fits.
 
 ### Configuration
 
@@ -68,12 +78,13 @@ With your main model set to e.g. `glm-5.2:cloud`:
 - Text and tool requests go straight to `glm-5.2:cloud` as before.
 - Image requests are first tried on `glm-5.2:cloud` with the real pixels. If it
   accepts (image-capable), it answers directly.
-- If `glm-5.2:cloud` rejects the image, `minimax-m3:cloud` reads the image at
-  full pixel fidelity — exactly as if it were the primary model — with the
-  user's accompanying text as context so it knows why it's being shown the
-  image. It writes a caption the way a vision model would, that caption
-  replaces the image bytes, and `glm-5.2:cloud` continues from the caption —
-  and keeps handling the rest of the task.
+- If `glm-5.2:cloud` rejects the image, `minimax-m3:cloud` is routed the same
+  request the primary would have received up to the image — the system prompt,
+  prior turns, and the image — exactly as if it were the primary model. It
+  reads the image at full pixel fidelity with that full context, writes a
+  caption the way a vision model would, that caption replaces the image bytes,
+  and `glm-5.2:cloud` continues from the caption — and keeps handling the rest
+  of the task.
 
 If `OLLAMA_CLOUD_VISION_FALLBACK` is unset, image-capable models still work via
 the conversion path, and non-vision models surface the original error as before.
