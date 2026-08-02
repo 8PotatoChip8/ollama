@@ -104,6 +104,23 @@ func replaceImagesInBlock(b anthropic.ContentBlock, caption string) anthropic.Co
 	return b
 }
 
+// captionSystemPrompt is the directive sent to the fallback in place of the
+// primary's system prompt when captioning. The primary's system prompt is
+// dropped because it is agent scaffolding (persona, tools, instructions) that
+// pushes the captioner to act on or comment on the user's task instead of
+// describing the image. The conversation messages are still forwarded, so the
+// captioner has the task context; this directive fixes its job to "describe
+// faithfully" so the primary gets a literal caption rather than a meta-comment
+// or an attempted answer.
+const captionSystemPrompt = `You are a vision assistant. The user's latest message contains an image that the primary model cannot see. Your only job is to describe that image so the primary model can act on it.
+
+- Transcribe all visible text verbatim, exactly as it appears (including headings, labels, buttons, and code).
+- Note counts, positions, colors, sizes, and layout precisely.
+- Describe fine visual detail — rendering, glyphs, spacing, alignment, state — do not gloss over it.
+- Be faithful and literal; if something is unreadable or unclear, say so rather than guessing.
+- Do not attempt the user's task, do not give instructions, and do not comment on the image itself — only describe its contents.
+- Keep the description focused and complete.`
+
 // captionText wraps a fallback response as the text that replaces an image
 // block, so the primary sees what the vision model made of the image in
 // context rather than the raw pixels.
@@ -111,7 +128,7 @@ func captionText(fallback, caption string) string {
 	var b strings.Builder
 	b.WriteString("[The user attached an image. A vision model (")
 	b.WriteString(fallback)
-	b.WriteString(") was given the full conversation up to this point — exactly as if it were the primary model — and responded:\n")
+	b.WriteString(") described it:\n")
 	b.WriteString(caption)
 	b.WriteString("\n]")
 	return b.String()
@@ -134,14 +151,16 @@ func extractAssistantText(resp anthropic.MessagesResponse) string {
 // caption the image(s) in the last message of msgs: the same messages the
 // primary would have seen up to and including that message, with the model
 // swapped to the fallback, streaming off, response length capped, and
-// tools/thinking stripped (the captioner only looks and responds, it does not
-// act). msgs is the (possibly trimmed) context window the caller has already
+// tools/thinking stripped (the captioner only looks and describes, it does not
+// act). The primary's system prompt is replaced with captionSystemPrompt so the
+// captioner describes the image faithfully instead of acting as the primary.
+// msgs is the (possibly trimmed) context window the caller has already
 // prepared.
 func buildCaptionRequest(req anthropic.MessagesRequest, msgs []anthropic.MessageParam, fallback string) anthropic.MessagesRequest {
 	return anthropic.MessagesRequest{
 		Model:     fallback,
 		Messages:  msgs,
-		System:    req.System,
+		System:    captionSystemPrompt,
 		Stream:    false,
 		MaxTokens: captionMaxTokens(req.MaxTokens),
 	}

@@ -18,6 +18,7 @@ import (
 type fakeMessagesCall struct {
 	model    string
 	hasImage bool
+	system   string // normalized to text for assertion
 }
 
 // fakeOllamaServer is a minimal stand-in for the Ollama server: it answers
@@ -74,7 +75,7 @@ func (f *fakeOllamaServer) handler(t *testing.T) http.Handler {
 			_ = json.Unmarshal(body, &req)
 			hasImg := hasImageContent(req)
 			f.mu.Lock()
-			f.messagesCalls = append(f.messagesCalls, fakeMessagesCall{model: req.Model, hasImage: hasImg})
+			f.messagesCalls = append(f.messagesCalls, fakeMessagesCall{model: req.Model, hasImage: hasImg, system: systemText(req.System)})
 			vision := f.vision[req.Model]
 			f.mu.Unlock()
 			if hasImg && !vision {
@@ -400,4 +401,73 @@ func bigString(n int) string {
 		b[i] = 'x'
 	}
 	return string(b)
+}
+
+// systemText normalizes a MessagesRequest.System value (string, or an array of
+// content blocks as decoded from JSON) to plain text for assertions.
+func systemText(s any) string {
+	switch v := s.(type) {
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				if t, ok := m["text"].(string); ok {
+					b.WriteString(t)
+				}
+			}
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// TestVisionFallback_CaptionUsesDescribeDirective: the caption call to the
+// fallback must carry the describe-image system directive, NOT the primary's
+// system prompt (which is agent scaffolding that would push the captioner to
+// act or comment instead of describing). The primary call keeps its own system.
+func TestVisionFallback_CaptionUsesDescribeDirective(t *testing.T) {
+	f := newFakeOllamaServer()
+	f.vision["minimax-m3:cloud"] = true
+	f.contextLength["minimax-m3:cloud"] = 8192
+	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
+	const primarySystem = "You are Claude Code, an interactive coding agent. Use tools."
+
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback)
+	defer stop()
+
+	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
+		Model:     primary,
+		MaxTokens: 1024,
+		Stream:    false,
+		System:    primarySystem,
+		Messages:  []anthropic.MessageParam{userMessage(textBlock("what is this?"), imageBlock("aGVsbG8="))},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var captionSys, primarySys string
+	for _, c := range f.calls() {
+		if c.model == fallback && c.hasImage {
+			captionSys = c.system
+		}
+		if c.model == primary && !c.hasImage {
+			primarySys = c.system
+		}
+	}
+	if captionSys == "" {
+		t.Fatal("expected a caption call to the fallback with an image")
+	}
+	if captionSys != captionSystemPrompt {
+		t.Errorf("caption call system should be the describe directive, got %q", captionSys)
+	}
+	if captionSys == primarySystem {
+		t.Errorf("caption call system leaked the primary's system prompt: %q", captionSys)
+	}
+	if primarySys != primarySystem {
+		t.Errorf("primary call system should keep the primary's system %q, got %q", primarySystem, primarySys)
+	}
 }
