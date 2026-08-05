@@ -18,6 +18,18 @@ import (
 	modelpkg "github.com/ollama/ollama/types/model"
 )
 
+// fallbackModeDirect routes an image turn the non-vision primary can't see
+// directly to the vision fallback, which answers it with full image
+// understanding (no lossy caption for the turn that needs the pixels). The
+// primary takes over on later text-only turns, reading any historical images
+// as captions.
+const fallbackModeDirect = "direct"
+
+// fallbackModeCaption captions each image via the fallback and lets the
+// primary answer over the resulting text, keeping the primary in the driver's
+// seat on every turn at the cost of a lossy intermediate description.
+const fallbackModeCaption = "caption"
+
 // startVisionFallbackProxy starts a localhost reverse proxy for one launch
 // that intercepts POST /v1/messages. Requests without image content pass
 // through to the Ollama server untouched (native Anthropic passthrough,
@@ -30,8 +42,9 @@ import (
 // Each launch is its own process with its own proxy on its own port, so
 // concurrent launches get isolated fallbacks with no cross-talk. The proxy is
 // a plain HTTP client of the local Ollama server — the server signs cloud
-// requests itself, so the proxy needs no cloud credentials.
-func startVisionFallbackProxy(primary, fallback string) (string, func() error, error) {
+// requests itself, so the proxy needs no cloud credentials. mode is
+// fallbackModeDirect or fallbackModeCaption.
+func startVisionFallbackProxy(primary, fallback, mode string) (string, func() error, error) {
 	target := envconfig.ConnectableHost()
 	client := &http.Client{} // no overall timeout: streaming primary responses are long-lived
 
@@ -47,6 +60,7 @@ func startVisionFallbackProxy(primary, fallback string) (string, func() error, e
 	handler := &visionFallbackHandler{
 		primary:     primary,
 		fallback:    fallback,
+		mode:        mode,
 		target:      target,
 		client:      client,
 		passthrough: passthrough,
@@ -89,6 +103,7 @@ func proxyErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 type visionFallbackHandler struct {
 	primary     string
 	fallback    string
+	mode        string
 	target      *url.URL
 	client      *http.Client
 	passthrough *httputil.ReverseProxy
@@ -147,9 +162,30 @@ func (h *visionFallbackHandler) handleVisionFallback(w http.ResponseWriter, r *h
 		}
 	}
 
+	// Direct mode: if the user attached a new image this turn, let the vision
+	// fallback answer the turn itself with full image understanding rather
+	// than producing a lossy caption the primary would have to trust. The
+	// primary takes over on later text-only turns (handled by the caption
+	// path below, which captions only the historical images for context).
+	if h.mode == fallbackModeDirect && latestUserMessageHasImage(req) {
+		req.Model = h.fallback
+		modified, err := encodeMessagesRequest(req)
+		if err != nil {
+			http.Error(w, "encode fallback request: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		slog.Info("vision fallback direct mode: routing image turn to fallback",
+			"primary", h.primary, "fallback", h.fallback)
+		h.forwardRaw(w, r, modified)
+		return
+	}
+
 	// Caption every image (cached), replace image blocks with caption text,
-	// and re-send to the primary. On caption failure, degrade to letting the
-	// fallback model answer this turn directly so the user still gets a reply.
+	// and re-send to the primary. This is the whole path in caption mode, and
+	// the historical-image-context path in direct mode (when the latest turn
+	// is text-only but earlier turns carried images). On caption failure,
+	// degrade to letting the fallback model answer this turn directly so the
+	// user still gets a reply.
 	if !captionRequestImages(h.client, baseURL, &req, h.fallback) {
 		slog.Warn("image captioning failed, degrading to vision fallback model for this turn", "fallback", h.fallback)
 		req.Model = h.fallback

@@ -131,12 +131,12 @@ func (f *fakeOllamaServer) showCallCount() int {
 
 // startFakeProxy wires a fake ollama server and a vision-fallback proxy pointed
 // at it. It returns the proxy URL and a stop function.
-func startFakeProxy(t *testing.T, f *fakeOllamaServer, primary, fallback string) (string, func()) {
+func startFakeProxy(t *testing.T, f *fakeOllamaServer, primary, fallback, mode string) (string, func()) {
 	t.Helper()
 	resetVisionFallbackCaches()
 	server := httptest.NewServer(f.handler(t))
 	t.Setenv("OLLAMA_HOST", server.URL)
-	proxyURL, stop, err := startVisionFallbackProxy(primary, fallback)
+	proxyURL, stop, err := startVisionFallbackProxy(primary, fallback, mode)
 	if err != nil {
 		server.Close()
 		t.Fatalf("startVisionFallbackProxy: %v", err)
@@ -181,7 +181,7 @@ func TestVisionFallback_NonVisionPrimaryCaptionsThenPrimary(t *testing.T) {
 	f.contextLength["minimax-m3:cloud"] = 8192
 	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
 
-	proxyURL, stop := startFakeProxy(t, f, primary, fallback)
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeCaption)
 	defer stop()
 
 	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
@@ -228,7 +228,7 @@ func TestVisionFallback_VisionPrimaryPassesThrough(t *testing.T) {
 	f.contextLength["minimax-m3:cloud"] = 8192
 	const primary, fallback = "minimax-m3:cloud", "gpt-oss:cloud"
 
-	proxyURL, stop := startFakeProxy(t, f, primary, fallback)
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeCaption)
 	defer stop()
 
 	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
@@ -260,7 +260,7 @@ func TestVisionFallback_CaptionCacheHit(t *testing.T) {
 	f.contextLength["minimax-m3:cloud"] = 8192
 	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
 
-	proxyURL, stop := startFakeProxy(t, f, primary, fallback)
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeCaption)
 	defer stop()
 
 	img := imageBlock("aGVsbG8=")
@@ -317,7 +317,7 @@ func TestVisionFallback_ContextOverflowTrims(t *testing.T) {
 	f.contextLength["minimax-m3:cloud"] = 200 // tiny window
 	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
 
-	proxyURL, stop := startFakeProxy(t, f, primary, fallback)
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeCaption)
 	defer stop()
 
 	img := imageBlock("aGVsbG8=")
@@ -351,7 +351,7 @@ func TestVisionFallback_DegradeOnCaptionFailure(t *testing.T) {
 	f.failFirstFallbackImg = 1 // the caption call (1st image-to-fallback) fails
 	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
 
-	proxyURL, stop := startFakeProxy(t, f, primary, fallback)
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeCaption)
 	defer stop()
 
 	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
@@ -378,7 +378,7 @@ func TestVisionFallback_NoImagePassesThrough(t *testing.T) {
 	f.vision["minimax-m3:cloud"] = true
 	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
 
-	proxyURL, stop := startFakeProxy(t, f, primary, fallback)
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeCaption)
 	defer stop()
 
 	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
@@ -463,7 +463,7 @@ func TestVisionFallback_CaptionUsesDescribeDirective(t *testing.T) {
 	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
 	const primarySystem = "You are Claude Code, an interactive coding agent. Use tools."
 
-	proxyURL, stop := startFakeProxy(t, f, primary, fallback)
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeCaption)
 	defer stop()
 
 	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
@@ -498,5 +498,160 @@ func TestVisionFallback_CaptionUsesDescribeDirective(t *testing.T) {
 	}
 	if primarySys != primarySystem {
 		t.Errorf("primary call system should keep the primary's system %q, got %q", primarySystem, primarySys)
+	}
+}
+
+// TestVisionFallback_DirectMode_NewImageRoutesToFallback: in direct mode, a
+// non-vision primary with a new image in the latest user message routes the
+// whole turn to the fallback with the REAL image (no caption step); the
+// primary is never called. The fallback answers directly.
+func TestVisionFallback_DirectMode_NewImageRoutesToFallback(t *testing.T) {
+	f := newFakeOllamaServer()
+	f.vision["minimax-m3:cloud"] = true
+	f.contextLength["minimax-m3:cloud"] = 8192
+	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
+
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeDirect)
+	defer stop()
+
+	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
+		Model:     primary,
+		MaxTokens: 1024,
+		Stream:    false,
+		Messages:  []anthropic.MessageParam{userMessage(textBlock("what is this?"), imageBlock("aGVsbG8="))},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	calls := f.calls()
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one call (to the fallback), got %+v", calls)
+	}
+	if calls[0].model != fallback {
+		t.Errorf("expected the call to go to fallback %q, got %q", fallback, calls[0].model)
+	}
+	if !calls[0].hasImage {
+		t.Errorf("expected the fallback to receive the real image, not a caption; calls=%+v", calls)
+	}
+}
+
+// TestVisionFallback_DirectMode_TextOnlyTurnCaptionsHistoryForPrimary: in
+// direct mode, when the latest user message is text-only but an earlier turn
+// carried an image, the historical image is captioned (cached) so the
+// non-vision primary can read it as text, and the primary answers. This is the
+// "primary takes over on text-only turns" handoff.
+func TestVisionFallback_DirectMode_TextOnlyTurnCaptionsHistoryForPrimary(t *testing.T) {
+	f := newFakeOllamaServer()
+	f.vision["minimax-m3:cloud"] = true
+	f.contextLength["minimax-m3:cloud"] = 8192
+	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
+
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeDirect)
+	defer stop()
+
+	img := imageBlock("aGVsbG8=")
+	// Earlier turn had an image; the latest user message is text-only.
+	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
+		Model: primary, MaxTokens: 1024, Stream: false,
+		Messages: []anthropic.MessageParam{
+			userMessage(textBlock("look at this"), img),
+			{Role: "assistant", Content: []anthropic.ContentBlock{textBlock("ok from " + fallback)}},
+			userMessage(textBlock("now summarize what you saw")),
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	calls := f.calls()
+	var captionCall, primaryCall bool
+	for _, c := range calls {
+		if c.model == fallback && c.hasImage {
+			captionCall = true // caption request to the fallback carries the historical image
+		}
+		if c.model == primary && !c.hasImage {
+			primaryCall = true // primary gets text (caption), not the raw image
+		}
+	}
+	if !captionCall {
+		t.Errorf("expected a caption call to the fallback for the historical image; calls=%+v", calls)
+	}
+	if !primaryCall {
+		t.Errorf("expected a primary call with the image replaced by caption text; calls=%+v", calls)
+	}
+	for _, c := range calls {
+		if c.model == primary && c.hasImage {
+			t.Errorf("primary must not receive the raw image; calls=%+v", calls)
+		}
+	}
+}
+
+// TestVisionFallback_DirectMode_VisionPrimaryPassesThrough: a vision-capable
+// primary passes through natively regardless of mode; the fallback is never
+// called.
+func TestVisionFallback_DirectMode_VisionPrimaryPassesThrough(t *testing.T) {
+	f := newFakeOllamaServer()
+	f.vision["minimax-m3:cloud"] = true
+	f.contextLength["minimax-m3:cloud"] = 8192
+	const primary, fallback = "minimax-m3:cloud", "gpt-oss:cloud"
+
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeDirect)
+	defer stop()
+
+	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
+		Model: primary, MaxTokens: 1024, Stream: false,
+		Messages: []anthropic.MessageParam{userMessage(textBlock("describe"), imageBlock("aGVsbG8="))},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	calls := f.calls()
+	if len(calls) != 1 || calls[0].model != primary || !calls[0].hasImage {
+		t.Errorf("expected a single pass-through call to the vision primary with image, got %+v", calls)
+	}
+}
+
+// TestVisionFallback_DirectMode_FallbackKeepsSystemAndImage: the direct-mode
+// forward to the fallback carries the PRIMARY's system prompt (not the caption
+// directive) and the real image — proving it is the "answer the turn" path,
+// not the caption path.
+func TestVisionFallback_DirectMode_FallbackKeepsSystemAndImage(t *testing.T) {
+	f := newFakeOllamaServer()
+	f.vision["minimax-m3:cloud"] = true
+	f.contextLength["minimax-m3:cloud"] = 8192
+	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
+	const primarySystem = "You are Claude Code, an interactive coding agent. Use tools."
+
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeDirect)
+	defer stop()
+
+	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
+		Model:     primary,
+		MaxTokens: 1024,
+		Stream:    false,
+		System:    primarySystem,
+		Messages:  []anthropic.MessageParam{userMessage(textBlock("what is this?"), imageBlock("aGVsbG8="))},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	calls := f.calls()
+	if len(calls) != 1 || calls[0].model != fallback {
+		t.Fatalf("expected one direct call to the fallback, got %+v", calls)
+	}
+	if !calls[0].hasImage {
+		t.Errorf("direct forward must keep the real image; calls=%+v", calls)
+	}
+	if calls[0].system != primarySystem {
+		t.Errorf("direct forward must keep the primary's system prompt %q, got %q (caption directive would be wrong)", primarySystem, calls[0].system)
+	}
+	if calls[0].system == captionSystemPrompt {
+		t.Errorf("direct forward must NOT use the caption directive; got it")
 	}
 }

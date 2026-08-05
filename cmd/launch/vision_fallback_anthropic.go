@@ -40,6 +40,22 @@ func messageHasImage(m anthropic.MessageParam) bool {
 	return false
 }
 
+// latestUserMessageHasImage reports whether the most recent user turn carries an
+// image. The Messages API is stateless and the client re-sends history each
+// turn, so a new image is the one in the last user message — the direct-mode
+// handoff rule keys off this to decide whether the vision fallback should
+// answer the turn itself or the primary should (with historical images
+// captioned). Images only in earlier turns are historical context, not a new
+// image this turn.
+func latestUserMessageHasImage(req anthropic.MessagesRequest) bool {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			return messageHasImage(req.Messages[i])
+		}
+	}
+	return false
+}
+
 // blockHasImage reports whether b is, or contains, an image block.
 func blockHasImage(b anthropic.ContentBlock) bool {
 	if b.Type == "image" {
@@ -110,14 +126,17 @@ func replaceImagesInBlock(b anthropic.ContentBlock, caption string) anthropic.Co
 // pushes the captioner to act on or comment on the user's task instead of
 // describing the image. The conversation messages are still forwarded, so the
 // captioner has the task context; this directive fixes its job to "describe
-// faithfully" so the primary gets a literal caption rather than a meta-comment
-// or an attempted answer.
+// faithfully and neutrally" so the primary gets a literal caption rather than
+// a meta-comment, an attempted answer, or an upbeat characterization it then
+// has to second-guess. Used in caption mode for every image turn, and in
+// direct mode for historical images on text-only continuation turns.
 const captionSystemPrompt = `You are a vision assistant. The user's latest message contains an image that the primary model cannot see. Your only job is to describe that image so the primary model can act on it.
 
 - Transcribe all visible text verbatim, exactly as it appears (including headings, labels, buttons, and code).
 - Note counts, positions, colors, sizes, and layout precisely.
 - Describe fine visual detail — rendering, glyphs, spacing, alignment, state — do not gloss over it.
-- Be faithful and literal; if something is unreadable or unclear, say so rather than guessing.
+- Use a neutral, clinical tone. Report only what is literally visible. Do not characterize quality, attractiveness, correctness, usefulness, or intent; do not praise, apologize, or soften.
+- If text or detail is unreadable or unclear, say "illegible" or "unclear" rather than guessing or filling it in.
 - Do not attempt the user's task, do not give instructions, and do not comment on the image itself — only describe its contents.
 - Keep the description focused and complete.`
 

@@ -376,7 +376,7 @@ func TestClaudeEnvVars(t *testing.T) {
 
 func TestClaudeEnvVarsUsesProxyBaseURL(t *testing.T) {
 	c := &Claude{}
-	c.SetVisionFallback("minimax-m3:cloud")
+	c.SetVisionFallback("minimax-m3:cloud", fallbackModeDirect)
 
 	// implements VisionFallbackRunner
 	var _ VisionFallbackRunner = c

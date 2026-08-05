@@ -14,16 +14,22 @@ import (
 
 // Claude implements Runner for Claude Code integration.
 type Claude struct {
-	fallback string
+	fallback     string
+	fallbackMode string
 }
 
 func (c *Claude) String() string { return "Claude Code" }
 
-// SetVisionFallback configures a vision-capable cloud model to caption images
-// for a non-vision primary. When set, Run starts a localhost proxy that
-// intercepts image-bearing /v1/messages requests and routes them through the
-// fallback, then points Claude Code at that proxy.
-func (c *Claude) SetVisionFallback(model string) { c.fallback = model }
+// SetVisionFallback configures a vision-capable cloud model to handle images
+// for a non-vision primary, and the mode ("direct" — the fallback answers
+// image turns itself — or "caption" — the fallback captions the image and the
+// primary answers). When set, Run starts a localhost proxy that intercepts
+// image-bearing /v1/messages requests and routes them through the fallback,
+// then points Claude Code at that proxy.
+func (c *Claude) SetVisionFallback(model, mode string) {
+	c.fallback = model
+	c.fallbackMode = mode
+}
 
 func (c *Claude) args(model string, extra []string) []string {
 	var args []string
@@ -65,13 +71,18 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 
 	baseURL := envconfig.Host().String()
 	if c.fallback != "" {
-		proxyURL, stop, err := startVisionFallbackProxy(model, c.fallback)
+		proxyURL, stop, err := startVisionFallbackProxy(model, c.fallback, c.fallbackMode)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not start vision fallback proxy, continuing without it: %v\n", err)
 		} else {
 			defer stop()
 			baseURL = proxyURL
-			fmt.Fprintf(os.Stderr, "Vision fallback enabled: captioning images via %s before sending to %s\n", c.fallback, model)
+			switch c.fallbackMode {
+			case fallbackModeCaption:
+				fmt.Fprintf(os.Stderr, "Vision fallback enabled (caption mode): captioning images via %s before sending to %s\n", c.fallback, model)
+			default:
+				fmt.Fprintf(os.Stderr, "Vision fallback enabled (direct mode): routing image turns to %s, %s handles text turns\n", c.fallback, model)
+			}
 		}
 	}
 

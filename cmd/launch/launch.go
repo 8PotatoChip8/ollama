@@ -133,6 +133,7 @@ type IntegrationLaunchRequest struct {
 	AccountStateProvider func() *AccountState
 	AccountStateUpdates  func(context.Context) <-chan *AccountState
 	Fallback             string
+	FallbackMode         string
 }
 
 var isInteractiveSession = func() bool {
@@ -149,10 +150,11 @@ type Runner interface {
 // VisionFallbackRunner is implemented by integrations that can route image
 // input through a vision-capable fallback model when the primary cannot see
 // images. SetVisionFallback is called once before Run with the --fallback
-// model (empty when no fallback was requested). Integrations that do not
-// implement this interface ignore --fallback.
+// model (empty when no fallback was requested) and the --fallback-mode
+// ("direct" or "caption"). Integrations that do not implement this interface
+// ignore --fallback.
 type VisionFallbackRunner interface {
-	SetVisionFallback(model string)
+	SetVisionFallback(model, mode string)
 }
 
 // Editor can edit config files for integrations that support model configuration.
@@ -287,6 +289,7 @@ func LaunchCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) erro
 	var yesFlag bool
 	var restoreFlag bool
 	var fallbackFlag string
+	var fallbackModeFlag string
 
 	cmd := &cobra.Command{
 		Use:   "launch [INTEGRATION] [-- [EXTRA_ARGS...]]",
@@ -385,6 +388,21 @@ Examples:
 				fallbackFlag = ""
 			}
 
+			switch fallbackModeFlag {
+			case fallbackModeDirect, fallbackModeCaption:
+				// valid
+			case "":
+				fallbackModeFlag = fallbackModeDirect
+			default:
+				fmt.Fprintf(os.Stderr, "Warning: ignoring unknown --fallback-mode %s (expected %q or %q); using %q\n", fallbackModeFlag, fallbackModeDirect, fallbackModeCaption, fallbackModeDirect)
+				fallbackModeFlag = fallbackModeDirect
+			}
+			if fallbackFlag == "" {
+				// mode is meaningless without a fallback; reset so we don't
+				// carry a stale value into a launch that has no fallback.
+				fallbackModeFlag = ""
+			}
+
 			headlessYes := yesFlag && !isInteractiveSession()
 			forceConfigure := configFlag || (modelFlag == "" && !headlessYes)
 			if forceConfigure && !configFlag && modelFlag == "" {
@@ -403,6 +421,7 @@ Examples:
 				ExtraArgs:      passArgs,
 				Policy:         &policy,
 				Fallback:       fallbackFlag,
+				FallbackMode:   fallbackModeFlag,
 			})
 			if errors.Is(err, ErrCancelled) {
 				return nil
@@ -416,6 +435,7 @@ Examples:
 	cmd.Flags().BoolVar(&restoreFlag, "restore", false, "Restore an integration to its default profile")
 	cmd.Flags().BoolVarP(&yesFlag, "yes", "y", false, "Automatically answer yes to confirmation prompts")
 	cmd.Flags().StringVar(&fallbackFlag, "fallback", "", "Vision-capable cloud model to caption images for a non-vision primary (e.g. minimax-m3:cloud)")
+	cmd.Flags().StringVar(&fallbackModeFlag, "fallback-mode", fallbackModeDirect, "How --fallback handles an image a non-vision primary can't see: "+fallbackModeDirect+" (the fallback answers the image turn directly) or "+fallbackModeCaption+" (the fallback captions the image and the primary answers)")
 	return cmd
 }
 
@@ -862,7 +882,7 @@ func (c *launcherClient) launchManagedSingleIntegration(ctx context.Context, nam
 		return nil
 	}
 
-	return runIntegration(runner, target, c.resolveRunModels(ctx, []string{target}), req.ExtraArgs, req.Fallback)
+	return runIntegration(runner, target, c.resolveRunModels(ctx, []string{target}), req.ExtraArgs, req.Fallback, req.FallbackMode)
 }
 
 func (c *launcherClient) launchManagedAutodiscoveryIntegration(ctx context.Context, name string, runner Runner, autodiscovery ManagedAutodiscoveryIntegration, saved *config.IntegrationConfig, req IntegrationLaunchRequest) error {
@@ -905,7 +925,7 @@ func (c *launcherClient) launchManagedAutodiscoveryIntegration(ctx context.Conte
 		return nil
 	}
 
-	return runIntegration(runner, target, c.resolveRunModels(ctx, []string{target}), req.ExtraArgs, req.Fallback)
+	return runIntegration(runner, target, c.resolveRunModels(ctx, []string{target}), req.ExtraArgs, req.Fallback, req.FallbackMode)
 }
 
 func (c *launcherClient) managedAutodiscoveryUsable(ctx context.Context, autodiscovery ManagedAutodiscoveryIntegration) bool {
@@ -1473,12 +1493,12 @@ func (c *launcherClient) resolveRunModels(ctx context.Context, models []string) 
 	return c.modelInventory().Resolve(ctx, models)
 }
 
-func runIntegration(runner Runner, modelName string, models []LaunchModel, args []string, fallback string) error {
+func runIntegration(runner Runner, modelName string, models []LaunchModel, args []string, fallback, fallbackMode string) error {
 	if len(models) == 0 && modelName != "" {
 		models = launchModelsFromNames([]string{modelName})
 	}
 	if vfr, ok := runner.(VisionFallbackRunner); ok && fallback != "" {
-		vfr.SetVisionFallback(fallback)
+		vfr.SetVisionFallback(fallback, fallbackMode)
 	}
 	return runner.Run(modelName, models, args)
 }
@@ -1496,7 +1516,7 @@ func launchAfterConfiguration(name string, runner Runner, model string, models [
 	if err := EnsureIntegrationInstalled(name, runner); err != nil {
 		return err
 	}
-	return runIntegration(runner, model, models, req.ExtraArgs, req.Fallback)
+	return runIntegration(runner, model, models, req.ExtraArgs, req.Fallback, req.FallbackMode)
 }
 
 func loadStoredIntegrationConfig(name string) (*config.IntegrationConfig, error) {
