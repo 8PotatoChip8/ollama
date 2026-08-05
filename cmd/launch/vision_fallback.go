@@ -2,6 +2,8 @@ package launch
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -40,10 +42,7 @@ func startVisionFallbackProxy(primary, fallback string) (string, func() error, e
 		req.Host = target.Host
 	}
 	passthrough.FlushInterval = -1 // unbuffered SSE streaming
-	passthrough.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		slog.Error("vision fallback proxy error", "error", err, "path", r.URL.Path)
-		http.Error(w, "proxy error: "+err.Error(), http.StatusBadGateway)
-	}
+	passthrough.ErrorHandler = proxyErrorHandler
 
 	handler := &visionFallbackHandler{
 		primary:     primary,
@@ -67,6 +66,20 @@ func startVisionFallbackProxy(primary, fallback string) (string, func() error, e
 	proxyURL := "http://" + listener.Addr().String()
 	stop := func() error { return server.Close() }
 	return proxyURL, stop, nil
+}
+
+// proxyErrorHandler is the reverse proxy's ErrorHandler. A client disconnect
+// mid-stream (the user stops generation, the agent moves on, or the request is
+// canceled) surfaces here as context.Canceled: the client is already gone, so
+// logging it at Error and writing a 502 is noise. Log it at Debug and return.
+// Any other error is a real transport failure worth surfacing as a 502.
+func proxyErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, context.Canceled) {
+		slog.Debug("vision fallback proxy: client canceled request", "path", r.URL.Path)
+		return
+	}
+	slog.Error("vision fallback proxy error", "error", err, "path", r.URL.Path)
+	http.Error(w, "proxy error: "+err.Error(), http.StatusBadGateway)
 }
 
 // visionFallbackHandler intercepts POST /v1/messages and routes image-bearing

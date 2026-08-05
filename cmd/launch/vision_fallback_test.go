@@ -2,7 +2,10 @@ package launch
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -392,6 +395,32 @@ func TestVisionFallback_NoImagePassesThrough(t *testing.T) {
 	}
 	if f.showCallCount() != 0 {
 		t.Errorf("expected no /api/show call for an image-less request, got %d", f.showCallCount())
+	}
+}
+
+// TestVisionFallback_ProxyErrorHandler: a client disconnect (context.Canceled)
+// is debug-logged and does NOT produce a 502; a real transport error still does.
+func TestVisionFallback_ProxyErrorHandler(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	rec := httptest.NewRecorder()
+	proxyErrorHandler(rec, req, context.Canceled)
+	if rec.Code != http.StatusOK {
+		t.Errorf("context.Canceled should not write an error response, got status %d body %q", rec.Code, rec.Body.String())
+	}
+
+	rec2 := httptest.NewRecorder()
+	proxyErrorHandler(rec2, req, errors.New("boom"))
+	if rec2.Code != http.StatusBadGateway {
+		t.Errorf("real error should be 502, got status %d body %q", rec2.Code, rec2.Body.String())
+	}
+
+	// A wrapped context.Canceled (as net/http hands the proxy on client
+	// disconnect) is also treated as a cancellation, not an error.
+	rec3 := httptest.NewRecorder()
+	proxyErrorHandler(rec3, req, fmt.Errorf("Get %q: %w", "http://127.0.0.1:1/v1/messages", context.Canceled))
+	if rec3.Code != http.StatusOK {
+		t.Errorf("wrapped context.Canceled should not write an error response, got status %d", rec3.Code)
 	}
 }
 
