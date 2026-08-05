@@ -175,14 +175,98 @@ func extractAssistantText(resp anthropic.MessagesResponse) string {
 // captioner describes the image faithfully instead of acting as the primary.
 // msgs is the (possibly trimmed) context window the caller has already
 // prepared.
+//
+// The forwarded messages are also stripped of tool scaffolding (tool_use,
+// tool_result, thinking) via stripToolScaffoldingForCaption: the primary's
+// tool-call history is irrelevant to describing an image, and some vision
+// models — notably minimax — recognize the tool-call pattern in the history and
+// respond by emitting their own native tool-call tokens as text (e.g.
+// "<]minimax[>...") instead of a caption, which would then be captured as a
+// garbage description. Images nested inside tool_result blocks (Claude Code
+// image Reads) are lifted out to plain image blocks so the captioner still sees
+// the pixels.
 func buildCaptionRequest(req anthropic.MessagesRequest, msgs []anthropic.MessageParam, fallback string) anthropic.MessagesRequest {
 	return anthropic.MessagesRequest{
 		Model:     fallback,
-		Messages:  msgs,
+		Messages:  stripToolScaffoldingForCaption(msgs),
 		System:    captionSystemPrompt,
 		Stream:    false,
 		MaxTokens: captionMaxTokens(req.MaxTokens),
 	}
+}
+
+// toolCallOmitted replaces assistant tool_use blocks in a caption request, so
+// the captioner sees that a tool was called without the tool-call payload that
+// primes some models to emit their own tool-call tokens.
+const toolCallOmitted = "[tool call omitted]"
+
+// toolResultOmitted replaces a tool_result block (after lifting out any image it
+// carried) in a caption request, so the user turn stays non-empty without
+// forwarding file-read text that is captioning noise and bloats the context.
+const toolResultOmitted = "[tool result omitted]"
+
+// stripToolScaffoldingForCaption returns a copy of msgs with all tool_use,
+// tool_result, and thinking blocks removed, so the captioner is sent a clean
+// text+image conversation. tool_result blocks that carry an image are replaced
+// by the image block itself (lifted out of the tool_result wrapper) so the
+// captioner still sees the pixels; every other tool_use/tool_result block
+// becomes a short text placeholder so messages stay non-empty and
+// user/assistant alternation (which the Messages API requires) is preserved.
+// thinking blocks are dropped as captioning noise. The original msgs is not
+// mutated.
+func stripToolScaffoldingForCaption(msgs []anthropic.MessageParam) []anthropic.MessageParam {
+	out := make([]anthropic.MessageParam, len(msgs))
+	for i := range msgs {
+		out[i].Role = msgs[i].Role
+		out[i].Content = stripBlocksForCaption(msgs[i].Content)
+		if len(out[i].Content) == 0 {
+			t := toolCallOmitted
+			out[i].Content = []anthropic.ContentBlock{{Type: "text", Text: &t}}
+		}
+	}
+	return out
+}
+
+func stripBlocksForCaption(blocks []anthropic.ContentBlock) []anthropic.ContentBlock {
+	var out []anthropic.ContentBlock
+	for _, b := range blocks {
+		switch b.Type {
+		case "tool_use", "server_tool_use":
+			t := toolCallOmitted
+			out = append(out, anthropic.ContentBlock{Type: "text", Text: &t})
+		case "tool_result":
+			out = append(out, liftToolResultImages(b)...)
+		case "thinking":
+			// Dropped: the captioner does not need the primary's reasoning.
+		default:
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// liftToolResultImages returns the image blocks carried inside a tool_result
+// block (lifted out of the tool_result wrapper), or a single placeholder text
+// block when the tool_result carried no image. Non-image content (e.g. file
+// read text) is omitted — it is captioning noise and bloats the caption
+// context.
+func liftToolResultImages(b anthropic.ContentBlock) []anthropic.ContentBlock {
+	inner, ok := toolResultContentBlocks(b.Content)
+	if !ok {
+		t := toolResultOmitted
+		return []anthropic.ContentBlock{{Type: "text", Text: &t}}
+	}
+	var imgs []anthropic.ContentBlock
+	for _, cb := range inner {
+		if cb.Type == "image" {
+			imgs = append(imgs, cb)
+		}
+	}
+	if len(imgs) == 0 {
+		t := toolResultOmitted
+		return []anthropic.ContentBlock{{Type: "text", Text: &t}}
+	}
+	return imgs
 }
 
 // captionMaxTokens caps the fallback's response length when captioning so a

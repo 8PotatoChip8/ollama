@@ -21,7 +21,8 @@ import (
 type fakeMessagesCall struct {
 	model    string
 	hasImage bool
-	system   string // normalized to text for assertion
+	system   string                   // normalized to text for assertion
+	messages []anthropic.MessageParam // decoded messages, for block-level assertions
 }
 
 // fakeOllamaServer is a minimal stand-in for the Ollama server: it answers
@@ -78,7 +79,7 @@ func (f *fakeOllamaServer) handler(t *testing.T) http.Handler {
 			_ = json.Unmarshal(body, &req)
 			hasImg := hasImageContent(req)
 			f.mu.Lock()
-			f.messagesCalls = append(f.messagesCalls, fakeMessagesCall{model: req.Model, hasImage: hasImg, system: systemText(req.System)})
+			f.messagesCalls = append(f.messagesCalls, fakeMessagesCall{model: req.Model, hasImage: hasImg, system: systemText(req.System), messages: req.Messages})
 			vision := f.vision[req.Model]
 			f.mu.Unlock()
 			if hasImg && !vision {
@@ -498,6 +499,101 @@ func TestVisionFallback_CaptionUsesDescribeDirective(t *testing.T) {
 	}
 	if primarySys != primarySystem {
 		t.Errorf("primary call system should keep the primary's system %q, got %q", primarySystem, primarySys)
+	}
+}
+
+// TestVisionFallback_CaptionRequestStripsToolScaffolding: the caption request
+// sent to the fallback must carry no tool_use/tool_result/thinking blocks — the
+// primary's tool-call history primes some vision models (notably minimax) to
+// emit their own native tool-call tokens as text instead of a caption. The
+// image nested inside a tool_result (as Claude Code sends after a Read of an
+// image file) must still reach the captioner, lifted out of the wrapper. The
+// primary's own request keeps its real tool-call history untouched.
+func TestVisionFallback_CaptionRequestStripsToolScaffolding(t *testing.T) {
+	f := newFakeOllamaServer()
+	f.vision["minimax-m3:cloud"] = true
+	f.contextLength["minimax-m3:cloud"] = 8192
+	const primary, fallback = "glm-5.2:cloud", "minimax-m3:cloud"
+
+	proxyURL, stop := startFakeProxy(t, f, primary, fallback, fallbackModeCaption)
+	defer stop()
+
+	// A tool-laden history ending in an image-bearing tool_result, exactly as
+	// Claude Code sends after a Read of an image file.
+	toolUse := anthropic.ContentBlock{Type: "tool_use", ID: "tu1", Name: "Read"}
+	toolResultWithImage := anthropic.ContentBlock{
+		Type:      "tool_result",
+		ToolUseID: "tu1",
+		Content:   []anthropic.ContentBlock{imageBlock("aGVsbG8=")},
+	}
+	resp := postMessages(t, proxyURL, anthropic.MessagesRequest{
+		Model: primary, MaxTokens: 1024, Stream: false,
+		Messages: []anthropic.MessageParam{
+			userMessage(textBlock("look at screen.png")),
+			{Role: "assistant", Content: []anthropic.ContentBlock{textBlock("reading it"), toolUse}},
+			userMessage(toolResultWithImage),
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var captionMsgs, primaryMsgs []anthropic.MessageParam
+	for _, c := range f.calls() {
+		if c.model == fallback && c.hasImage {
+			captionMsgs = c.messages
+		}
+		if c.model == primary && !c.hasImage {
+			primaryMsgs = c.messages
+		}
+	}
+	if captionMsgs == nil {
+		t.Fatal("expected a caption call to the fallback carrying an image")
+	}
+
+	// The caption request must contain no tool_use, tool_result, or thinking
+	// blocks.
+	for i, m := range captionMsgs {
+		for _, b := range m.Content {
+			if b.Type == "tool_use" || b.Type == "tool_result" || b.Type == "thinking" {
+				t.Errorf("caption request msg[%d] (role %s) still carries a %s block; tool scaffolding should be stripped: %+v", i, m.Role, b.Type, m.Content)
+			}
+		}
+	}
+	// The image must still be present, lifted out of the tool_result.
+	var hasImage bool
+	for _, m := range captionMsgs {
+		for _, b := range m.Content {
+			if b.Type == "image" {
+				hasImage = true
+			}
+		}
+	}
+	if !hasImage {
+		t.Errorf("caption request lost the image when lifting it out of the tool_result: %+v", captionMsgs)
+	}
+	// The assistant turn that was a tool call must not have been dropped (the
+	// Messages API requires alternating roles); it becomes a placeholder text.
+	if len(captionMsgs) != 3 {
+		t.Errorf("caption request should keep all 3 turns (no messages dropped), got %d: %+v", len(captionMsgs), captionMsgs)
+	}
+
+	// The primary's own request keeps its real tool-call history (only the
+	// image is swapped for caption text); stripping is caption-only.
+	var primaryStillHasToolUse, primaryStillHasToolResult bool
+	for _, m := range primaryMsgs {
+		for _, b := range m.Content {
+			if b.Type == "tool_use" {
+				primaryStillHasToolUse = true
+			}
+			if b.Type == "tool_result" {
+				primaryStillHasToolResult = true
+			}
+		}
+	}
+	if !primaryStillHasToolUse || !primaryStillHasToolResult {
+		t.Errorf("primary request should keep its tool_use/tool_result history; got tool_use=%v tool_result=%v: %+v", primaryStillHasToolUse, primaryStillHasToolResult, primaryMsgs)
 	}
 }
 
